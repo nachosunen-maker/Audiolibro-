@@ -4,7 +4,7 @@ object ChapterTextChunker {
 
   const val DEFAULT_MAX_CHARS_PER_CHUNK = 1800
 
-  private val SENTENCE_SPLIT_REGEX = Regex("(?<=[.!?…][\"”»')\\]]*)\\s+")
+  private val PARAGRAPH_SPLIT_REGEX = Regex("\\n\\s*\\n")
   private val WORD_SPLIT_REGEX = Regex("\\s+")
 
   /**
@@ -21,7 +21,7 @@ object ChapterTextChunker {
     if (normalized.isEmpty()) return emptyList()
 
     val paragraphs =
-      normalized.split(Regex("\\n\\s*\\n")).map { it.trim() }.filter { it.isNotEmpty() }
+      normalized.split(PARAGRAPH_SPLIT_REGEX).map { it.trim() }.filter { it.isNotEmpty() }
 
     val result = mutableListOf<String>()
     val currentChunk = StringBuilder()
@@ -52,12 +52,64 @@ object ChapterTextChunker {
     return result
   }
 
+  fun splitSentences(paragraph: String): List<String> {
+    if (paragraph.isBlank()) return emptyList()
+    val sentences = mutableListOf<String>()
+    val current = StringBuilder()
+    var i = 0
+    val length = paragraph.length
+
+    while (i < length) {
+      val c = paragraph[i]
+      current.append(c)
+
+      if (isSentenceTerminator(c)) {
+        var j = i + 1
+        val extra = StringBuilder()
+        while (j < length && (isSentenceTerminator(paragraph[j]) || isClosingPunctuation(paragraph[j]))) {
+          extra.append(paragraph[j])
+          j++
+        }
+        if (j == length || paragraph[j].isWhitespace()) {
+          current.append(extra)
+          val s = current.toString().trim()
+          if (s.isNotEmpty()) {
+            sentences.add(s)
+          }
+          current.setLength(0)
+          while (j < length && paragraph[j].isWhitespace()) {
+            j++
+          }
+          i = j
+        } else {
+          i++
+        }
+      } else {
+        i++
+      }
+    }
+
+    if (current.isNotEmpty()) {
+      val last = current.toString().trim()
+      if (last.isNotEmpty()) {
+        sentences.add(last)
+      }
+    }
+    return sentences
+  }
+
+  private fun isSentenceTerminator(c: Char): Boolean =
+    c == '.' || c == '!' || c == '?' || c == '…'
+
+  private fun isClosingPunctuation(c: Char): Boolean =
+    c == '"' || c == '”' || c == '“' || c == '’' || c == '\'' || c == '»' || c == '«' || c == ')' || c == ']'
+
   private fun appendOversizedParagraph(
     paragraph: String,
     maxChars: Int,
     out: MutableList<String>,
   ) {
-    val sentences = paragraph.split(SENTENCE_SPLIT_REGEX).map { it.trim() }.filter { it.isNotEmpty() }
+    val sentences = splitSentences(paragraph)
     val buffer = StringBuilder()
 
     fun flushBuffer() {

@@ -33,6 +33,7 @@ import com.google.common.util.concurrent.Futures
 import com.google.common.util.concurrent.ListenableFuture
 import java.io.File
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -663,5 +664,16 @@ class AudiobookPhase2RobolectricTest {
     override fun handleRelease(): ListenableFuture<*> {
       return Futures.immediateVoidFuture()
     }
+  }
+
+  @Test
+  fun `generation exception during initial prep sets isRunning false and stores error message`() = runTest {
+    val dao = db.audiobookDao()
+    val repo = AudiobookRepository(context, dao)
+    repo.startAudiobookGeneration("non-existent-book-id")
+    val progress = repo.generationProgress.map { it["non-existent-book-id"] }.first { it != null && !it.isRunning }
+    assertNotNull(progress)
+    assertFalse(progress!!.isRunning)
+    assertNotNull(progress.errorMessage)
   }
 }

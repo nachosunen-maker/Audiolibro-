@@ -2,6 +2,7 @@ package com.example.data.repository
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import android.provider.OpenableColumns
 import com.example.data.local.AppDatabase
 import com.example.data.local.AudiobookDao
@@ -21,6 +22,8 @@ import com.example.epub.EpubParseException
 import com.example.epub.EpubParser
 import java.io.File
 import java.util.UUID
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -50,7 +53,18 @@ class AudiobookRepository(
       synthesisProvider = audioSynthesisProvider,
     )
 
-  private val generationScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+  private val generationExceptionHandler =
+    CoroutineExceptionHandler { _, throwable ->
+      if (throwable !is CancellationException) {
+        Log.e(
+          TAG_GEN,
+          "Excepción no controlada capturada en generationScope: ${throwable.javaClass.simpleName} - ${throwable.message}",
+          throwable,
+        )
+      }
+    }
+  private val generationScope =
+    CoroutineScope(SupervisorJob() + Dispatchers.IO + generationExceptionHandler)
   private val activeJobs = mutableMapOf<String, Job>()
 
   private val _generationProgress =
@@ -189,20 +203,39 @@ class AudiobookRepository(
 
     val job =
       generationScope.launch {
-        val result =
-          orchestrator.generateBookAudiobook(bookId) { progress ->
-            _generationProgress.update { map -> map + (bookId to progress) }
+        try {
+          val result =
+            orchestrator.generateBookAudiobook(bookId) { progress ->
+              _generationProgress.update { map -> map + (bookId to progress) }
+            }
+          result.onFailure { err ->
+            Log.e(TAG_GEN, "Fallo en generación de audiolibro (bookId=$bookId): ${err.javaClass.simpleName} - ${err.message}", err)
+            _generationProgress.update { map ->
+              val current = map[bookId] ?: BookGenerationProgress(bookId = bookId, isRunning = false)
+              map +
+                (bookId to
+                  current.copy(
+                    isRunning = false,
+                    errorMessage = err.localizedMessage ?: "No se pudo completar la generación.",
+                  ))
+            }
           }
-        result.onFailure { err ->
+        } catch (e: CancellationException) {
+          Log.i(TAG_GEN, "Generación cancelada para bookId=$bookId")
+          throw e
+        } catch (t: Throwable) {
+          Log.e(TAG_GEN, "Excepción no controlada en generación de audiolibro (bookId=$bookId): ${t.javaClass.simpleName} - ${t.message}", t)
           _generationProgress.update { map ->
             val current = map[bookId] ?: BookGenerationProgress(bookId = bookId, isRunning = false)
             map +
               (bookId to
                 current.copy(
                   isRunning = false,
-                  errorMessage = err.localizedMessage ?: "No se pudo completar la generación.",
+                  errorMessage = t.localizedMessage ?: "Ocurrió un error inesperado durante la generación.",
                 ))
           }
+        } finally {
+          activeJobs.remove(bookId)
         }
       }
     activeJobs[bookId] = job
@@ -300,6 +333,7 @@ class AudiobookRepository(
   }
 
   companion object {
+    private const val TAG_GEN = "AudiobookGeneration"
     private const val PREFS_PLAYBACK = "audiolibro_playback_prefs"
     private const val KEY_LAST_PLAYED_BOOK_ID = "last_played_book_id"
 

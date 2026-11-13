@@ -93,7 +93,7 @@ jobs:
         with:
           packages: |
             platform-tools
-            platforms;android-36.1
+            platforms;android-36
             build-tools;36.0.0
 
       - name: Verify Android SDK licenses and installation
@@ -115,8 +115,8 @@ jobs:
           echo "Using sdkmanager: $SDKMANAGER"
           yes | "$SDKMANAGER" --licenses
           ls -la "$SDK_DIR/platforms" "$SDK_DIR/build-tools" "$SDK_DIR/licenses"
-          if [ ! -d "$SDK_DIR/platforms/android-36.1" ]; then
-            echo "::error::Expected Android platform android-36.1 not installed in $SDK_DIR/platforms."
+          if [ ! -d "$SDK_DIR/platforms/android-36" ]; then
+            echo "::error::Expected Android platform android-36 not installed in $SDK_DIR/platforms."
             exit 1
           fi
 

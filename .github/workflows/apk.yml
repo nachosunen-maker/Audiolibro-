@@ -13,28 +13,96 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
+
+      - name: Verify checked-out project files
+        run: |
+          set -euo pipefail
+          echo "Workspace: $(pwd)"
+          for f in \
+            settings.gradle.kts \
+            build.gradle.kts \
+            gradle.properties \
+            gradle/libs.versions.toml \
+            gradle/wrapper/gradle-wrapper.properties \
+            app/build.gradle.kts \
+            app/src/main/AndroidManifest.xml \
+            app/google-services.json \
+            app/src/main/res/values/firebase_applet_config.xml \
+            .env.example; do
+            if [ ! -f "$f" ]; then
+              echo "::error::Missing required project file in repository: $f"
+              exit 1
+            fi
+            echo "OK: $f ($(wc -c < "$f") bytes)"
+          done
+          if [ -s debug.keystore.base64 ]; then
+            echo "OK: debug.keystore.base64 ($(wc -c < debug.keystore.base64) bytes)"
+          else
+            echo "::warning::debug.keystore.base64 missing or empty."
+          fi
 
       - name: Set up JDK 17
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v5
         with:
           distribution: temurin
           java-version: '17'
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
+      - name: Set up Android SDK and required packages
+        uses: android-actions/setup-android@v4
+        with:
+          packages: |
+            platform-tools
+            platforms;android-36.1
+            build-tools;36.0.0
+
+      - name: Verify Android SDK licenses and installation
+        run: |
+          set -euo pipefail
+          java -version
+          SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
+          echo "ANDROID_HOME=${ANDROID_HOME:-unset}"
+          echo "ANDROID_SDK_ROOT=${ANDROID_SDK_ROOT:-unset}"
+          if [ -z "$SDK_DIR" ] || [ ! -d "$SDK_DIR" ]; then
+            echo "::error::Android SDK directory was not configured."
+            exit 1
+          fi
+          SDKMANAGER="$(command -v sdkmanager || find "$SDK_DIR/cmdline-tools" -name sdkmanager -type f 2>/dev/null | head -n1 || true)"
+          if [ -z "$SDKMANAGER" ]; then
+            echo "::error::sdkmanager executable not found under $SDK_DIR."
+            exit 1
+          fi
+          echo "Using sdkmanager: $SDKMANAGER"
+          # Strictly accept SDK licenses without suppressing errors
+          yes | "$SDKMANAGER" --licenses
+          ls -la "$SDK_DIR/platforms" "$SDK_DIR/build-tools" "$SDK_DIR/licenses"
+          if [ ! -d "$SDK_DIR/platforms/android-36.1" ]; then
+            echo "::error::Expected Android platform android-36.1 not installed in $SDK_DIR/platforms."
+            exit 1
+          fi
 
       - name: Set up Gradle 9.3.1
-        uses: gradle/actions/setup-gradle@v4
+        uses: gradle/actions/setup-gradle@v6
         with:
           gradle-version: '9.3.1'
+          cache-provider: basic
 
       - name: Prepare debug keystore
         run: |
-          if [ -s debug.keystore.base64 ]; then
-            tr -d '\r\n ' < debug.keystore.base64 | base64 -d > debug.keystore || rm -f debug.keystore
-          fi
-          if [ ! -f debug.keystore ]; then
+          set -euo pipefail
+          if [ -f debug.keystore ] && keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey >/dev/null 2>&1; then
+            echo "OK: Valid existing debug.keystore found in project root; reusing it without regeneration."
+          elif [ -s debug.keystore.base64 ]; then
+            echo "Decoding debug.keystore.base64 into debug.keystore..."
+            tr -d '\r\n ' < debug.keystore.base64 | base64 -d > debug.keystore
+            if keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey >/dev/null 2>&1; then
+              echo "OK: debug.keystore successfully decoded and verified."
+            else
+              echo "::error::Decoded debug.keystore failed keytool validation."
+              exit 1
+            fi
+          else
+            echo "::warning::No valid debug keystore or base64 source found; generating standard debug keystore."
             keytool -genkeypair -v \
               -keystore debug.keystore \
               -storepass android \
@@ -44,10 +112,19 @@ jobs:
               -keysize 2048 \
               -validity 10000 \
               -dname "CN=Android Debug,O=Android,C=US"
+            keytool -list -keystore debug.keystore -storepass android -alias androiddebugkey >/dev/null
           fi
 
       - name: Build signed debug APK
-        run: gradle :app:assembleDebug --no-daemon --stacktrace
+        run: |
+          set -euo pipefail
+          gradle --version
+          gradle :app:assembleDebug --no-daemon --stacktrace
+          if [ ! -s app/build/outputs/apk/debug/app-debug.apk ]; then
+            echo "::error::APK was not generated at app/build/outputs/apk/debug/app-debug.apk"
+            exit 1
+          fi
+          ls -lh app/build/outputs/apk/debug/
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4

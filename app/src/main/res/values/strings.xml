@@ -1,0 +1,27 @@
+<resources>
+    <string name="app_name">Audiolibro</string>
+    <string name="library_title">Audiolibro</string>
+    <string name="library_subtitle">Tu estudio de lectura y voz</string>
+    <string name="empty_library_title">Tu biblioteca está vacía</string>
+    <string name="empty_library_body">Selecciona un archivo EPUB de tu dispositivo para extraer sus capítulos, analizar el texto y generar tu audiolibro.</string>
+    <string name="action_select_epub">Seleccionar archivo EPUB</string>
+    <string name="action_import_epub">Importar EPUB</string>
+    <string name="analyzing_epub">Analizando estructura y capítulos del EPUB…</string>
+    <string name="voice_section_title">Voz de narración</string>
+    <string name="voice_male_title">Voz masculina</string>
+    <string name="voice_female_title">Voz femenina</string>
+    <string name="chapters_section_title">Capítulos extraídos</string>
+    <string name="search_chapters_hint">Buscar capítulo…</string>
+    <string name="action_delete_book">Eliminar libro</string>
+    <string name="delete_book_confirm_title">¿Eliminar libro de la biblioteca?</string>
+    <string name="delete_book_confirm_body">Se eliminará la copia analizada y los audios generados de este dispositivo. Tu archivo EPUB original no se modificará.</string>
+    <string name="action_cancel">Cancelar</string>
+    <string name="action_delete">Eliminar</string>
+    <string name="action_back">Volver</string>
+    <string name="action_info">Información de arquitectura</string>
+    <string name="action_copy_text">Copiar texto del capítulo</string>
+    <string name="copied_to_clipboard">Texto del capítulo copiado</string>
+    <string name="action_prev_chapter">Anterior</string>
+    <string name="action_next_chapter">Siguiente</string>
+    <string name="notification_channel_playback">Reproducción de audiolibros</string>
+</resources>

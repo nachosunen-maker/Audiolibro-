@@ -1,0 +1,6 @@
+{
+  "name": "Audiolibro",
+  "description": "Aplicación Android nativa para analizar archivos EPUB localmente, extraer capítulos y preparar su conversión a audiolibro con voz IA.",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

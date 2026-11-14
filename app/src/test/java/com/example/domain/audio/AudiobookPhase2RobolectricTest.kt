@@ -4,6 +4,7 @@ import android.content.Context
 import android.net.Uri
 import android.os.Looper
 import androidx.compose.ui.test.assertIsDisplayed
+import androidx.compose.ui.test.assertTextEquals
 import androidx.compose.ui.test.hasScrollToNodeAction
 import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
@@ -676,4 +677,99 @@ class AudiobookPhase2RobolectricTest {
     assertFalse(progress!!.isRunning)
     assertNotNull(progress.errorMessage)
   }
+
+  @Test
+  fun `getAppCheckDebugToken reads exact SDK StorageHelper secret without generating or overwriting`() {
+    if (com.google.firebase.FirebaseApp.getApps(context).isEmpty()) {
+      com.google.firebase.FirebaseApp.initializeApp(context)
+    }
+    val app = com.google.firebase.FirebaseApp.getInstance()
+    val prefsName = "com.google.firebase.appcheck.debug.store.${app.persistenceKey}"
+    val prefs = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
+    prefs.edit().clear().commit()
+
+    assertNull(com.example.firebase.getAppCheckDebugToken(context))
+    assertNull(prefs.getString("com.google.firebase.appcheck.debug.DEBUG_SECRET", null))
+
+    val observed = mutableListOf<String?>()
+    val unregister = com.example.firebase.observeAppCheckDebugToken(context) { observed += it }
+    assertEquals(listOf<String?>(null), observed)
+
+    val sdkSecret = "11111111-2222-4333-8444-555555555555"
+    val storageHelper =
+      com.google.firebase.appcheck.debug.internal.StorageHelper(context, app.persistenceKey)
+    storageHelper.saveDebugSecret(sdkSecret)
+
+    assertEquals(sdkSecret, storageHelper.retrieveDebugSecret())
+    assertEquals(sdkSecret, com.example.firebase.getAppCheckDebugToken(context))
+    assertEquals(sdkSecret, observed.lastOrNull())
+    unregister()
+  }
+
+  @Test
+  fun `BookDetailScreen debug diagnostic shows unavailable state then displays and copies real SDK token`() =
+    runTest {
+      if (com.google.firebase.FirebaseApp.getApps(context).isEmpty()) {
+        com.google.firebase.FirebaseApp.initializeApp(context)
+      }
+      val app = com.google.firebase.FirebaseApp.getInstance()
+      val prefs =
+        context.getSharedPreferences(
+          "com.google.firebase.appcheck.debug.store.${app.persistenceKey}",
+          Context.MODE_PRIVATE,
+        )
+      prefs.edit().clear().commit()
+
+      val dao = db.audiobookDao()
+      insertSampleBook(dao, "book-1", NarratorVoice.FEMALE)
+      val repo = AudiobookRepository(context, dao, storageManager = storageManager)
+      val testPlayer = InMemoryPlaylistPlayer()
+      val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
+      val vm = BookDetailViewModel("book-1", repo, controller)
+
+      composeRule.setContent {
+        AudiolibroTheme {
+          BookDetailScreen(
+            viewModel = vm,
+            onNavigateBack = {},
+            onOpenChapterText = { _, _ -> },
+            onOpenPlayer = { _, _ -> },
+          )
+        }
+      }
+
+      composeRule.waitUntil(timeoutMillis = 5_000L) {
+        composeRule.onAllNodesWithTag("debug_appcheck_diagnostic_section").fetchSemanticsNodes().isNotEmpty() ||
+          composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
+      }
+
+      composeRule
+        .onNode(hasScrollToNodeAction())
+        .performScrollToNode(hasTestTag("debug_appcheck_diagnostic_section"))
+      composeRule.onNodeWithTag("debug_appcheck_diagnostic_section").assertIsDisplayed()
+      composeRule.onNodeWithTag("debug_appcheck_token_unavailable").assertIsDisplayed()
+
+      val realSdkToken = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
+      val storageHelper =
+        com.google.firebase.appcheck.debug.internal.StorageHelper(context, app.persistenceKey)
+      storageHelper.saveDebugSecret(realSdkToken)
+
+      composeRule
+        .onNode(hasScrollToNodeAction())
+        .performScrollToNode(hasTestTag("refresh_debug_appcheck_token_button"))
+      composeRule.onNodeWithTag("refresh_debug_appcheck_token_button").performClick()
+
+      composeRule.waitUntil(timeoutMillis = 5_000L) {
+        composeRule.onAllNodesWithTag("debug_appcheck_token_value").fetchSemanticsNodes().isNotEmpty()
+      }
+      composeRule.onNodeWithTag("debug_appcheck_token_value").assertTextEquals(realSdkToken)
+      composeRule.onNodeWithTag("copy_debug_appcheck_token_button").performClick()
+      composeRule.waitForIdle()
+
+      val clipboard =
+        context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
+      assertEquals(realSdkToken, clipboard.primaryClip?.getItemAt(0)?.text?.toString())
+      testPlayer.release()
+    }
 }
+

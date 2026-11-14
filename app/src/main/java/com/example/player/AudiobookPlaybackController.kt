@@ -16,6 +16,8 @@ import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
+import kotlinx.coroutines.cancel
+import kotlinx.coroutines.channels.Channel
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
@@ -23,6 +25,7 @@ import kotlinx.coroutines.flow.asStateFlow
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withContext
 
 data class PlaybackUiState(
   val isConnected: Boolean = false,
@@ -56,6 +59,14 @@ class AudiobookPlaybackController(
   private var lastSavedAtMs = 0L
   private var hydratingBookId: String? = null
   private var restoreAttempted = false
+  private val persistenceQueue = Channel<PersistenceRequest>(Channel.UNLIMITED)
+
+  private sealed interface PersistenceRequest {
+    data class Save(val bookId: String, val chapterIndex: Int, val positionMs: Long) :
+      PersistenceRequest
+
+    data class Flush(val ack: kotlinx.coroutines.CompletableDeferred<Unit>) : PersistenceRequest
+  }
 
   private val _uiState = MutableStateFlow(PlaybackUiState(isConnected = injectedPlayer != null))
   val uiState: StateFlow<PlaybackUiState> = _uiState.asStateFlow()
@@ -93,6 +104,21 @@ class AudiobookPlaybackController(
     }
 
   init {
+    scope.launch(Dispatchers.IO) {
+      for (request in persistenceQueue) {
+        when (request) {
+          is PersistenceRequest.Save ->
+            runCatching {
+              repository.updatePlaybackPosition(
+                request.bookId,
+                request.chapterIndex,
+                request.positionMs,
+              )
+            }
+          is PersistenceRequest.Flush -> request.ack.complete(Unit)
+        }
+      }
+    }
     injectedPlayer?.addListener(playerListener)
     if (injectedPlayer != null && injectedPlayer.mediaItemCount > 0) {
       syncFromPlayer()
@@ -336,12 +362,20 @@ class AudiobookPlaybackController(
     _uiState.update { it.copy(errorMessage = null) }
   }
 
+  suspend fun awaitPersistenceForTesting() {
+    val ack = kotlinx.coroutines.CompletableDeferred<Unit>()
+    persistenceQueue.trySend(PersistenceRequest.Flush(ack))
+    withContext(Dispatchers.Default) { ack.await() }
+  }
+
   fun releaseForTesting() {
     stopPositionTicker()
     activePlayer?.removeListener(playerListener)
     controllerFuture?.let { MediaController.releaseFuture(it) }
     controllerFuture = null
     activePlayer = null
+    persistenceQueue.close()
+    scope.cancel()
     if (INSTANCE === this) {
       INSTANCE = null
     }
@@ -489,7 +523,7 @@ class AudiobookPlaybackController(
     val bookId = current.activeBookId ?: return
     val chapterIndex = current.currentChapterIndex ?: return
     val pos = activePlayer?.currentPosition?.coerceAtLeast(0L) ?: current.positionMs
-    scope.launch { repository.updatePlaybackPosition(bookId, chapterIndex, pos) }
+    persistenceQueue.trySend(PersistenceRequest.Save(bookId, chapterIndex, pos))
   }
 
   companion object {

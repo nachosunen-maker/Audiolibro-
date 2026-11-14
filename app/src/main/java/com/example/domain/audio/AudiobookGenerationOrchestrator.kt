@@ -107,6 +107,35 @@ class AudiobookGenerationOrchestrator(
               continue
             }
 
+            if (!storage.hasSufficientStorageSpace()) {
+              val msg =
+                "Espacio de almacenamiento insuficiente en el dispositivo para guardar el siguiente fragmento de audio."
+              dao.upsertChunk(chunk.copy(status = ChapterChunkStatus.ERROR.name))
+              dao.updateChapterAudioState(
+                chapterId = chapter.id,
+                audioStatus = AudioGenerationStatus.ERROR.name,
+                audioFilePath = null,
+                audioDurationMs = 0L,
+                audioSizeBytes = 0L,
+                generatedChunks = doneCount,
+                totalChunks = totalChunks,
+                generationError = msg,
+              )
+              onProgress(
+                BookGenerationProgress(
+                  bookId = bookId,
+                  isRunning = false,
+                  currentChapterIndex = chapter.chapterIndex,
+                  totalChapters = chapters.size,
+                  currentChunkIndex = chunk.chunkIndex + 1,
+                  totalChunksInChapter = totalChunks,
+                  completedChapters = completedChapters,
+                  errorMessage = msg,
+                )
+              )
+              return Result.failure(java.io.IOException(msg))
+            }
+
             onProgress(
               BookGenerationProgress(
                 bookId = bookId,

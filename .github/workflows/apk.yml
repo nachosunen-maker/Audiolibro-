@@ -29,50 +29,6 @@ jobs:
           set -euo pipefail
           sdkmanager "platform-tools" "platforms;android-36.1" "build-tools;36.0.0"
 
-      - name: Create and validate google-services.json
-        run: |
-          set -euo pipefail
-          mkdir -p app
-          cat << 'EOF' > app/google-services.json
-          {
-            "project_info": {
-              "project_number": "545883078205",
-              "project_id": "gen-lang-client-0560185680",
-              "storage_bucket": "gen-lang-client-0560185680.firebasestorage.app"
-            },
-            "client": [
-              {
-                "client_info": {
-                  "mobilesdk_app_id": "1:545883078205:android:0d185b1aff45c9aa2b3454",
-                  "android_client_info": {
-                    "package_name": "com.aistudio.audiolibro.vqprmz"
-                  }
-                },
-                "oauth_client": [],
-                "api_key": [
-                  {
-                    "current_key": "AIzaSyDj1Tp2XDK7xB66aeWzVe0wwTsm8W08VDA"
-                  }
-                ],
-                "services": {
-                  "appinvite_service": {
-                    "other_platform_oauth_client": []
-                  }
-                }
-              }
-            ],
-            "configuration_version": "1"
-          }
-          EOF
-          python3 -c "
-          import json
-          with open('app/google-services.json') as f:
-              data = json.load(f)
-          pkg = data['client'][0]['client_info']['android_client_info']['package_name']
-          assert pkg == 'com.aistudio.audiolibro.vqprmz', f'Unexpected package name: {pkg}'
-          print('OK: app/google-services.json is valid and matches package com.aistudio.audiolibro.vqprmz')
-          "
-
       - name: Prepare debug keystore
         run: |
           set -euo pipefail

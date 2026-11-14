@@ -6,20 +6,20 @@ import kotlin.math.max
 
 enum class NarratorVoice(
   val displayName: String,
-  val geminiVoiceName: String,
+  val speakerId: Int,
   val description: String,
 ) {
   MALE(
     displayName = "Masculina",
-    geminiVoiceName = "Charon",
+    speakerId = 0,
     description =
-      "Voz masculina serena, grave e informativa (perfil Charon), ideal para narración literaria.",
+      "Voz masculina en español de España (Piper VITS · es_ES-sharvard-medium, speaker ID 0). Procesamiento 100 % local sin conexión.",
   ),
   FEMALE(
     displayName = "Femenina",
-    geminiVoiceName = "Kore",
+    speakerId = 1,
     description =
-      "Voz femenina firme, clara y equilibrada (perfil Kore), ideal para lectura continua.",
+      "Voz femenina en español de España (Piper VITS · es_ES-sharvard-medium, speaker ID 1). Procesamiento 100 % local sin conexión.",
   );
 
   companion object {

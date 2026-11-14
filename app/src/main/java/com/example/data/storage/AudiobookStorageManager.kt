@@ -41,6 +41,17 @@ class AudiobookStorageManager(private val context: Context) {
     }
   }
 
+  fun availableStorageBytes(): Long = runCatching { context.filesDir.usableSpace }.getOrDefault(0L)
+
+  fun hasSufficientStorageSpace(minBytes: Long = MIN_FREE_STORAGE_BYTES): Boolean {
+    val free = availableStorageBytes()
+    return free == 0L || free >= minBytes
+  }
+
+  companion object {
+    const val MIN_FREE_STORAGE_BYTES: Long = 32L * 1024L * 1024L
+  }
+
   suspend fun exportChapterWav(chapter: Chapter, destinationUri: Uri): Result<Long> =
     withContext(Dispatchers.IO) {
       try {

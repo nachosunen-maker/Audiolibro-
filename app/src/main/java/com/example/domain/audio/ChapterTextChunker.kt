@@ -2,7 +2,7 @@ package com.example.domain.audio
 
 object ChapterTextChunker {
 
-  const val DEFAULT_MAX_CHARS_PER_CHUNK = 1800
+  const val DEFAULT_MAX_CHARS_PER_CHUNK = 900
 
   private val PARAGRAPH_SPLIT_REGEX = Regex("\\n\\s*\\n")
   private val WORD_SPLIT_REGEX = Regex("\\s+")

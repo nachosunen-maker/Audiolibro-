@@ -14,25 +14,34 @@ import androidx.compose.foundation.layout.height
 import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.verticalScroll
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.outlined.AutoAwesome
+import androidx.compose.material.icons.outlined.Gavel
 import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.MenuBook
-import androidx.compose.material.icons.outlined.Security
+import androidx.compose.material.icons.outlined.OfflineBolt
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.ExperimentalMaterial3Api
 import androidx.compose.material3.HorizontalDivider
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -233,6 +242,8 @@ fun ArchitectureInfoSheet(
   audioProvider: AudioSynthesisProvider,
   onDismiss: () -> Unit,
 ) {
+  var showLegalNotices by remember { mutableStateOf(false) }
+
   ModalBottomSheet(
     onDismissRequest = onDismiss,
     containerColor = MaterialTheme.colorScheme.surface,
@@ -240,6 +251,7 @@ fun ArchitectureInfoSheet(
     Column(
       modifier =
         Modifier.fillMaxWidth()
+          .verticalScroll(rememberScrollState())
           .padding(horizontal = 24.dp)
           .padding(bottom = 32.dp),
       verticalArrangement = Arrangement.spacedBy(16.dp),
@@ -260,28 +272,118 @@ fun ArchitectureInfoSheet(
       HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
       ArchitectureRow(
-        icon = Icons.Outlined.AutoAwesome,
+        icon = Icons.Outlined.OfflineBolt,
         title =
           if (audioProvider.isConfigured) {
-            "Firebase AI Logic activo · ${audioProvider.modelId}"
+            "Motor local sin conexión · ${audioProvider.modelId}"
           } else {
-            "Firebase AI Logic pendiente · ${audioProvider.modelId}"
+            "Modelo local no encontrado · ${audioProvider.modelId}"
           },
         description =
-          "Generación de voz WAV por fragmentos reanudables con perfiles Kore (femenina) y Charon (masculina), reproducción Media3 en segundo plano y exportación WAV.",
+          "Síntesis neuronal local mediante Piper VITS + sherpa-onnx (22.050 Hz, 16 bits PCM WAV) con dos voces en español de España: masculina (ID 0) y femenina (ID 1). No requiere Internet ni nube.",
       )
 
       HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
 
       ArchitectureRow(
-        icon = Icons.Outlined.Security,
-        title = "App Check (Debug + Play Integrity)",
+        icon = Icons.Outlined.Gavel,
+        title = "Transparencia de voz sintética y licencias",
         description =
-          "Sin claves API embebidas en el código ni servidores propios. Usa DebugAppCheckProviderFactory en desarrollo y PlayIntegrityAppCheckProviderFactory en producción.",
+          "Las voces son generadas sintéticamente en el dispositivo por un modelo neuronal entrenado con grabaciones humanas; no son grabaciones literales de las personas locutoras.",
       )
+
+      OutlinedButton(
+        onClick = { showLegalNotices = true },
+        modifier = Modifier.fillMaxWidth().height(48.dp).testTag("open_legal_notices_button"),
+        shape = MaterialTheme.shapes.medium,
+      ) {
+        Icon(imageVector = Icons.Outlined.Gavel, contentDescription = null)
+        Spacer(modifier = Modifier.width(8.dp))
+        Text("Ver avisos legales y licencias")
+      }
 
       Spacer(modifier = Modifier.height(4.dp))
     }
+  }
+
+  if (showLegalNotices) {
+    LegalNoticesDialog(onDismiss = { showLegalNotices = false })
+  }
+}
+
+@Composable
+fun LegalNoticesDialog(onDismiss: () -> Unit) {
+  AlertDialog(
+    onDismissRequest = onDismiss,
+    modifier = Modifier.testTag("legal_notices_dialog"),
+    title = { Text("Avisos legales y licencias") },
+    text = {
+      Column(
+        modifier = Modifier.verticalScroll(rememberScrollState()),
+        verticalArrangement = Arrangement.spacedBy(12.dp),
+      ) {
+        LegalLicenseBlock(
+          title = "Aviso sobre voces sintéticas",
+          license = "Generación neuronal local",
+          body =
+            "Las narraciones generadas por Audiolibro se producen de forma sintética mediante modelos neuronales entrenados con grabaciones humanas. No constituyen grabaciones literales ni actuaciones directas de los hablantes originales.",
+        )
+        HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
+        LegalLicenseBlock(
+          title = "sherpa-onnx (k2-fsa/sherpa-onnx v2.0.1)",
+          license = "Apache License 2.0",
+          body =
+            "Motor de inferencia offline para texto a voz basado en ONNX Runtime, distribuido bajo licencia Apache 2.0.",
+        )
+        LegalLicenseBlock(
+          title = "Modelo Piper VITS es_ES-sharvard-medium",
+          license = "MIT License",
+          body =
+            "Pesos y configuración del modelo acústico Piper empaquetados para sherpa-onnx bajo licencia MIT.",
+        )
+        LegalLicenseBlock(
+          title = "Corpus SHARVARD (Aubanel, García Lecumberri y Cooke)",
+          license = "Creative Commons Atribución (CC BY 3.0 / CC BY 4.0)",
+          body =
+            "Basado en el corpus SHARVARD de español peninsular (University of Edinburgh DataShare · DOI: 10.3109/14992027.2014.907507), atribuido a Vincent Aubanel, María Luisa García Lecumberri y Martin Cooke.",
+        )
+        LegalLicenseBlock(
+          title = "eSpeak NG (espeak-ng-data)",
+          license = "GNU General Public License v3.0+ (GPLv3+)",
+          body =
+            "Datos fonéticos y conversión texto-a-fonemas en español proporcionados por eSpeak NG bajo licencia GPLv3 o posterior.",
+        )
+      }
+    },
+    confirmButton = {
+      TextButton(
+        onClick = onDismiss,
+        modifier = Modifier.minimumInteractiveComponentSize().testTag("close_legal_notices_button"),
+      ) {
+        Text("Cerrar")
+      }
+    },
+  )
+}
+
+@Composable
+private fun LegalLicenseBlock(title: String, license: String, body: String) {
+  Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
+    Text(
+      text = title,
+      style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+      color = MaterialTheme.colorScheme.onSurface,
+    )
+    Text(
+      text = license,
+      style = MaterialTheme.typography.labelMedium,
+      color = MaterialTheme.colorScheme.primary,
+    )
+    Text(
+      text = body,
+      style = MaterialTheme.typography.bodySmall,
+      color = MaterialTheme.colorScheme.onSurfaceVariant,
+    )
   }
 }
 

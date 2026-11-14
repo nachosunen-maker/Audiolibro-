@@ -142,7 +142,7 @@ fun AudiobookPlayerScreen(
             )
             if (book != null) {
               Text(
-                text = "Voz ${book.selectedVoice.displayName.lowercase()} (${book.selectedVoice.geminiVoiceName})",
+                text = "Voz ${book.selectedVoice.displayName.lowercase()} · Local offline (ID ${book.selectedVoice.speakerId})",
                 style = MaterialTheme.typography.bodySmall,
                 color = MaterialTheme.colorScheme.onSurfaceVariant,
               )

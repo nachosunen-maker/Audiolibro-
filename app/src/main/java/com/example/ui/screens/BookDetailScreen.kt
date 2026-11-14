@@ -23,12 +23,10 @@ import androidx.compose.foundation.layout.widthIn
 import androidx.compose.foundation.lazy.LazyColumn
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
-import androidx.compose.foundation.text.selection.SelectionContainer
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.KeyboardArrowRight
 import androidx.compose.material.icons.outlined.AutoAwesome
-import androidx.compose.material.icons.outlined.ContentCopy
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.FolderDelete
@@ -36,9 +34,7 @@ import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.PlayArrow
 import androidx.compose.material.icons.outlined.RecordVoiceOver
-import androidx.compose.material.icons.outlined.Refresh
 import androidx.compose.material.icons.outlined.Search
-import androidx.compose.material.icons.outlined.Security
 import androidx.compose.material.icons.outlined.Storage
 import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material.icons.rounded.CheckCircle
@@ -67,32 +63,22 @@ import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
-import androidx.compose.runtime.DisposableEffect
 import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
-import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
-import androidx.compose.ui.platform.LocalClipboardManager
-import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
-import androidx.compose.ui.text.AnnotatedString
-import androidx.compose.ui.text.font.FontFamily
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
-import com.example.BuildConfig
 import com.example.R
-import com.example.firebase.getAppCheckDebugToken
-import com.example.firebase.observeAppCheckDebugToken
-import kotlinx.coroutines.launch
 import com.example.domain.audio.AudioSynthesisProvider
 import com.example.domain.audio.BookGenerationProgress
 import com.example.domain.model.AudioGenerationStatus
@@ -103,6 +89,7 @@ import com.example.domain.model.NarrationEstimator
 import com.example.domain.model.NarratorVoice
 import com.example.ui.components.BookCover
 import com.example.ui.components.InfoChip
+import com.example.ui.components.LegalNoticesDialog
 import com.example.ui.components.MiniPlayerBar
 import com.example.ui.components.formatIntegerEs
 import com.example.ui.viewmodel.BookDetailUiState
@@ -121,10 +108,9 @@ fun BookDetailScreen(
   val exportFeedback by viewModel.exportFeedback.collectAsStateWithLifecycle()
 
   val snackbarHostState = remember { SnackbarHostState() }
-  val clipboardManager = LocalClipboardManager.current
-  val coroutineScope = rememberCoroutineScope()
   var showDeleteBookDialog by remember { mutableStateOf(false) }
   var showDeleteAudioDialog by remember { mutableStateOf(false) }
+  var showLegalNoticesDialog by remember { mutableStateOf(false) }
   var chapterQuery by remember { mutableStateOf("") }
   var pendingChapterToExport by remember { mutableStateOf<Chapter?>(null) }
 
@@ -258,20 +244,8 @@ fun BookDetailScreen(
                   onCancel = viewModel::cancelGeneration,
                   onDismissError = viewModel::clearGenerationError,
                   onOpenPlayer = { onOpenPlayer(book.id, null) },
+                  onOpenLegalNotices = { showLegalNoticesDialog = true },
                 )
-              }
-
-              if (BuildConfig.DEBUG) {
-                item {
-                  DebugAppCheckDiagnosticSection(
-                    onCopyToken = { token ->
-                      clipboardManager.setText(AnnotatedString(token))
-                      coroutineScope.launch {
-                        snackbarHostState.showSnackbar("Token de depuración copiado al portapapeles")
-                      }
-                    },
-                  )
-                }
               }
 
               item {
@@ -417,6 +391,10 @@ fun BookDetailScreen(
         }
       },
     )
+  }
+
+  if (showLegalNoticesDialog) {
+    LegalNoticesDialog(onDismiss = { showLegalNoticesDialog = false })
   }
 }
 
@@ -685,6 +663,7 @@ private fun AudiobookGenerationSection(
   onCancel: () -> Unit,
   onDismissError: () -> Unit,
   onOpenPlayer: () -> Unit,
+  onOpenLegalNotices: () -> Unit,
 ) {
   val book = bookWithChapters.book
   val chapters = bookWithChapters.chapters
@@ -730,12 +709,32 @@ private fun AudiobookGenerationSection(
         }
       }
 
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        Text(
+          text = "100 % local sin conexión · ${audioProvider.modelId}",
+          style = MaterialTheme.typography.bodySmall,
+          color = MaterialTheme.colorScheme.onSurfaceVariant,
+          modifier = Modifier.weight(1f),
+        )
+        TextButton(
+          onClick = onOpenLegalNotices,
+          contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
+          modifier = Modifier.testTag("detail_legal_notices_button"),
+        ) {
+          Text("Licencias y voz", style = MaterialTheme.typography.labelMedium)
+        }
+      }
+
       if (!audioProvider.isConfigured) {
         Surface(
           modifier = Modifier.fillMaxWidth(),
           shape = MaterialTheme.shapes.medium,
-          color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.7f),
-          border = BorderStroke(1.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.4f)),
+          color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f),
+          border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.4f)),
         ) {
           Row(
             modifier = Modifier.padding(12.dp),
@@ -745,20 +744,20 @@ private fun AudiobookGenerationSection(
             Icon(
               imageVector = Icons.Outlined.WarningAmber,
               contentDescription = null,
-              tint = MaterialTheme.colorScheme.onTertiaryContainer,
+              tint = MaterialTheme.colorScheme.onErrorContainer,
               modifier = Modifier.size(20.dp),
             )
             Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
               Text(
-                text = "Requiere activar Firebase AI Logic (${audioProvider.modelId})",
+                text = "Modelo local no disponible (${audioProvider.modelId})",
                 style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                color = MaterialTheme.colorScheme.onErrorContainer,
               )
               Text(
                 text =
-                  "Aún no existe google-services.json en el proyecto. Activa Firebase AI Logic y App Check (sin claves API en la app) para sintetizar los archivos WAV reales.",
+                  "No se encontraron los archivos empaquetados de Piper / sherpa-onnx en assets. Reinstala o compila el paquete completo.",
                 style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onTertiaryContainer,
+                color = MaterialTheme.colorScheme.onErrorContainer,
               )
             }
           }
@@ -1126,154 +1125,4 @@ private fun ChapterStatusBadge(chapter: Chapter) {
   }
 }
 
-@Composable
-private fun DebugAppCheckDiagnosticSection(
-  onCopyToken: (String) -> Unit,
-) {
-  if (!BuildConfig.DEBUG) return
-
-  val context = LocalContext.current
-  var debugToken by remember { mutableStateOf(getAppCheckDebugToken(context)) }
-
-  DisposableEffect(context) {
-    val unregister = observeAppCheckDebugToken(context) { updatedToken ->
-      debugToken = updatedToken
-    }
-    onDispose { unregister() }
-  }
-
-  Surface(
-    modifier = Modifier.fillMaxWidth().testTag("debug_appcheck_diagnostic_section"),
-    shape = MaterialTheme.shapes.large,
-    color = MaterialTheme.colorScheme.surface,
-    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-  ) {
-    Column(
-      modifier = Modifier.padding(18.dp),
-      verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-      ) {
-        Row(
-          horizontalArrangement = Arrangement.spacedBy(8.dp),
-          verticalAlignment = Alignment.CenterVertically,
-          modifier = Modifier.weight(1f),
-        ) {
-          Icon(
-            imageVector = Icons.Outlined.Security,
-            contentDescription = null,
-            tint = MaterialTheme.colorScheme.primary,
-          )
-          Text(
-            text = "Diagnóstico Debug · App Check",
-            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
-            color = MaterialTheme.colorScheme.onSurface,
-          )
-        }
-        Surface(
-          shape = RoundedCornerShape(8.dp),
-          color = MaterialTheme.colorScheme.tertiaryContainer,
-        ) {
-          Text(
-            text = "DEBUG",
-            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.Bold),
-            color = MaterialTheme.colorScheme.onTertiaryContainer,
-            modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
-          )
-        }
-      }
-
-      Text(
-        text =
-          "Para autorizar esta compilación Debug en este dispositivo, registra el token de depuración en Firebase Console > App Check > Apps > Administrar tokens de depuración.",
-        style = MaterialTheme.typography.bodySmall,
-        color = MaterialTheme.colorScheme.onSurfaceVariant,
-      )
-
-      val activeToken = debugToken
-      if (!activeToken.isNullOrBlank()) {
-        Surface(
-          modifier = Modifier.fillMaxWidth(),
-          shape = MaterialTheme.shapes.medium,
-          color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.65f),
-          border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-        ) {
-          SelectionContainer {
-            Text(
-              text = activeToken,
-              style = MaterialTheme.typography.bodySmall.copy(fontFamily = FontFamily.Monospace),
-              color = MaterialTheme.colorScheme.onSurface,
-              modifier = Modifier.padding(12.dp).testTag("debug_appcheck_token_value"),
-            )
-          }
-        }
-
-        Row(
-          modifier = Modifier.fillMaxWidth(),
-          horizontalArrangement = Arrangement.spacedBy(10.dp),
-          verticalAlignment = Alignment.CenterVertically,
-        ) {
-          Button(
-            onClick = { onCopyToken(activeToken) },
-            modifier =
-              Modifier.weight(1f).height(48.dp).testTag("copy_debug_appcheck_token_button"),
-            shape = MaterialTheme.shapes.medium,
-          ) {
-            Icon(
-              imageVector = Icons.Outlined.ContentCopy,
-              contentDescription = null,
-              modifier = Modifier.size(18.dp),
-            )
-            Spacer(modifier = Modifier.width(8.dp))
-            Text("Copiar token", style = MaterialTheme.typography.labelLarge)
-          }
-          OutlinedButton(
-            onClick = { debugToken = getAppCheckDebugToken(context) },
-            modifier = Modifier.height(48.dp).testTag("refresh_debug_appcheck_token_button"),
-            shape = MaterialTheme.shapes.medium,
-          ) {
-            Icon(
-              imageVector = Icons.Outlined.Refresh,
-              contentDescription = "Actualizar token de depuración",
-              modifier = Modifier.size(18.dp),
-            )
-          }
-        }
-      } else {
-        Surface(
-          modifier = Modifier.fillMaxWidth().testTag("debug_appcheck_token_unavailable"),
-          shape = MaterialTheme.shapes.medium,
-          color = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.5f),
-          border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-        ) {
-          Text(
-            text =
-              "El token Debug todavía no está disponible en el almacenamiento local del SDK. Pulsa «Generar audiolibro» o «Actualizar» para comprobar si Firebase App Check ya lo ha persistido.",
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(12.dp),
-          )
-        }
-
-        OutlinedButton(
-          onClick = { debugToken = getAppCheckDebugToken(context) },
-          modifier =
-            Modifier.fillMaxWidth().height(48.dp).testTag("refresh_debug_appcheck_token_button"),
-          shape = MaterialTheme.shapes.medium,
-        ) {
-          Icon(
-            imageVector = Icons.Outlined.Refresh,
-            contentDescription = null,
-            modifier = Modifier.size(18.dp),
-          )
-          Spacer(modifier = Modifier.width(8.dp))
-          Text("Actualizar estado del token", style = MaterialTheme.typography.labelLarge)
-        }
-      }
-    }
-  }
-}
 

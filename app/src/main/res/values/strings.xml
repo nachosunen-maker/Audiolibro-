@@ -3,7 +3,7 @@
     <string name="library_title">Audiolibro</string>
     <string name="library_subtitle">Tu estudio de lectura y voz</string>
     <string name="empty_library_title">Tu biblioteca está vacía</string>
-    <string name="empty_library_body">Selecciona un archivo EPUB de tu dispositivo para extraer sus capítulos, analizar el texto y generar tu audiolibro.</string>
+    <string name="empty_library_body">Selecciona un archivo EPUB de tu dispositivo para extraer sus capítulos y generar tu audiolibro localmente sin conexión.</string>
     <string name="action_select_epub">Seleccionar archivo EPUB</string>
     <string name="action_import_epub">Importar EPUB</string>
     <string name="analyzing_epub">Analizando estructura y capítulos del EPUB…</string>

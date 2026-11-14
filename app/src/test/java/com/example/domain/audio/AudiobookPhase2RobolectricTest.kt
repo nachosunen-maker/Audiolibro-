@@ -10,7 +10,9 @@ import androidx.compose.ui.test.hasTestTag
 import androidx.compose.ui.test.junit4.createComposeRule
 import androidx.compose.ui.test.onAllNodesWithTag
 import androidx.compose.ui.test.onNodeWithTag
+import androidx.compose.ui.test.onNodeWithText
 import androidx.compose.ui.test.performClick
+import androidx.compose.ui.test.performScrollTo
 import androidx.compose.ui.test.performScrollToNode
 import androidx.media3.common.C
 import androidx.media3.common.MediaItem
@@ -77,36 +79,29 @@ class AudiobookPhase2RobolectricTest {
   }
 
   @Test
-  fun `configured Firebase provider uses gemini-3_8-flash-tts configures App Check and never fakes failed chapters`() =
+  fun `offline architecture has no INTERNET permission uses PiperAudioSynthesisProvider and never fakes failed chapters`() =
     runTest {
+      val pkgInfo =
+        context.packageManager.getPackageInfo(
+          context.packageName,
+          android.content.pm.PackageManager.GET_PERMISSIONS,
+        )
+      val permissions = pkgInfo.requestedPermissions?.toSet().orEmpty()
+      assertFalse(permissions.contains(android.Manifest.permission.INTERNET))
+
       val dao = db.audiobookDao()
       insertSampleBook(dao, "book-1", NarratorVoice.FEMALE)
 
-      val debugToken = "00000000-0000-0000-0000-000000000001"
-      val launchIntent =
-        android.content.Intent().putExtra("FIREBASE_APPCHECK_DEBUG_TOKEN", debugToken)
-      com.example.firebase.configureAppCheck(context, launchIntent)
-
-      val app = com.google.firebase.FirebaseApp.getInstance()
-      val prefs =
-        context.getSharedPreferences(
-          "com.google.firebase.appcheck.debug.store.${app.persistenceKey}",
-          Context.MODE_PRIVATE,
-        )
-      assertEquals(
-        debugToken,
-        prefs.getString("com.google.firebase.appcheck.debug.DEBUG_SECRET", null),
-      )
-
-      val provider = FirebaseAiAudioSynthesisProvider(context)
-      assertEquals("gemini-3.8-flash-tts", provider.modelId)
-      assertTrue(provider.isConfigured)
+      val defaultRepo = AudiobookRepository(context, dao, storageManager = storageManager)
+      assertTrue(defaultRepo.audioSynthesisProvider is PiperAudioSynthesisProvider)
+      assertEquals("es_ES-sharvard-medium", defaultRepo.audioSynthesisProvider.modelId)
+      assertTrue(defaultRepo.audioSynthesisProvider.isConfigured)
 
       val failingProvider =
         object : AudioSynthesisProvider {
           override val isConfigured = true
-          override val providerName = "Firebase AI Logic"
-          override val modelId = "gemini-3.8-flash-tts"
+          override val providerName = "Piper VITS + sherpa-onnx (Local)"
+          override val modelId = "es_ES-sharvard-medium"
 
           override suspend fun synthesizeFragment(
             text: String,
@@ -114,7 +109,7 @@ class AudiobookPhase2RobolectricTest {
             bookTitle: String,
             chapterTitle: String,
           ): Result<SynthesizedAudioPayload> =
-            Result.failure(IllegalStateException("Error de App Check o red al contactar Gemini"))
+            Result.failure(IllegalStateException("Fallo local al inicializar el modelo Piper"))
         }
 
       val orchestrator = AudiobookGenerationOrchestrator(dao, storageManager, failingProvider)
@@ -128,12 +123,12 @@ class AudiobookPhase2RobolectricTest {
     }
 
   @Test
-  fun `voice selection persists Charon for male and Kore for female and drives synthesis`() = runTest {
+  fun `voice selection persists speakerId 0 for male and 1 for female and drives local synthesis`() = runTest {
     val dao = db.audiobookDao()
     insertSampleBook(dao, "book-1", NarratorVoice.FEMALE)
 
-    assertEquals("Kore", NarratorVoice.FEMALE.geminiVoiceName)
-    assertEquals("Charon", NarratorVoice.MALE.geminiVoiceName)
+    assertEquals(1, NarratorVoice.FEMALE.speakerId)
+    assertEquals(0, NarratorVoice.MALE.speakerId)
     assertEquals(2, NarratorVoice.entries.size)
 
     dao.updateSelectedVoice("book-1", NarratorVoice.MALE.name)
@@ -144,8 +139,8 @@ class AudiobookPhase2RobolectricTest {
     val testProvider =
       object : AudioSynthesisProvider {
         override val isConfigured = true
-        override val providerName = "TestGemini"
-        override val modelId = "gemini-3.8-flash-tts"
+        override val providerName = "Piper VITS + sherpa-onnx (Local)"
+        override val modelId = "es_ES-sharvard-medium"
 
         override suspend fun synthesizeFragment(
           text: String,
@@ -156,9 +151,9 @@ class AudiobookPhase2RobolectricTest {
           observedVoices += voice
           return Result.success(
             SynthesizedAudioPayload(
-              bytes = ByteArray(4800) { 1 },
-              mimeType = "audio/L16;rate=24000",
-              sampleRate = 24_000,
+              bytes = ByteArray(4410) { 1 },
+              mimeType = "audio/L16;rate=22050;channels=1",
+              sampleRate = 22_050,
             )
           )
         }
@@ -233,8 +228,8 @@ class AudiobookPhase2RobolectricTest {
       val flakyProvider =
         object : AudioSynthesisProvider {
           override val isConfigured = true
-          override val providerName = "TestGemini"
-          override val modelId = "gemini-3.8-flash-tts"
+          override val providerName = "TestLocalPiper"
+          override val modelId = "es_ES-sharvard-medium"
 
           override suspend fun synthesizeFragment(
             text: String,
@@ -244,14 +239,14 @@ class AudiobookPhase2RobolectricTest {
           ): Result<SynthesizedAudioPayload> {
             if (failOnSecondChunkOfCh2 && text == expectedCh2Fragments[1]) {
               failOnSecondChunkOfCh2 = false
-              return Result.failure(IllegalStateException("Corte temporal de red"))
+              return Result.failure(IllegalStateException("Interrupción temporal de prueba"))
             }
             synthesizedTexts += text
             return Result.success(
               SynthesizedAudioPayload(
-                bytes = ByteArray(9600) { 2 },
-                mimeType = "audio/L16;rate=24000",
-                sampleRate = 24_000,
+                bytes = ByteArray(8820) { 2 },
+                mimeType = "audio/L16;rate=22050;channels=1",
+                sampleRate = 22_050,
               )
             )
           }
@@ -407,12 +402,14 @@ class AudiobookPhase2RobolectricTest {
     controller.jumpToChapter(1)
     assertEquals(1, controller.uiState.value.currentChapterIndex)
     assertTrue(controller.uiState.value.isPlaying)
+    controller.awaitPersistenceForTesting()
 
     repo.updatePlaybackPosition("book-1", 2, 1100L)
     val savedBook = dao.getBookOnce("book-1")
     assertEquals(2, savedBook?.lastPlayedChapterIndex)
     assertEquals(1100L, savedBook?.lastPlayedPositionMs)
 
+    controller.releaseForTesting()
     testPlayer.release()
   }
 
@@ -458,8 +455,114 @@ class AudiobookPhase2RobolectricTest {
       }.getOrDefault(false)
     }
     assertEquals(NarratorVoice.MALE.name, dao.getBookOnce("book-1")?.selectedVoice)
+
+    // Verify LegalNoticesDialog opens from BookDetailScreen and lists required licenses & notice
+    composeRule
+      .onNode(hasScrollToNodeAction())
+      .performScrollToNode(hasTestTag("detail_legal_notices_button"))
+    composeRule.onNodeWithTag("detail_legal_notices_button").performClick()
+    composeRule.waitForIdle()
+    composeRule.onNodeWithTag("legal_notices_dialog").assertIsDisplayed()
+    composeRule.onNodeWithText("Apache License 2.0", substring = true).assertIsDisplayed()
+    composeRule.onNodeWithText("MIT License", substring = true).assertIsDisplayed()
+    composeRule.onNodeWithText("Corpus SHARVARD", substring = true).performScrollTo().assertIsDisplayed()
+    composeRule
+      .onNodeWithText("GNU General Public License v3.0+", substring = true)
+      .performScrollTo()
+      .assertIsDisplayed()
+    composeRule.onNodeWithTag("close_legal_notices_button").performClick()
+    composeRule.waitForIdle()
+
+    controller.releaseForTesting()
     testPlayer.release()
   }
+
+  @Test
+  fun `long multi-chapter book generates in chunks recovers from cancellation and merges cleanly`() =
+    runTest {
+      val dao = db.audiobookDao()
+      val longBookId = "long-book-1"
+      val chapterCount = 15
+      val longParagraph =
+        (1..20).joinToString(" ") { idx ->
+          "Fragmento literario número $idx en español peninsular con signos ¿verdad? y ¡qué claridad!"
+        }
+      val chapters =
+        (1..chapterCount).map { chIdx ->
+          ChapterEntity(
+            id = "${longBookId}_ch_$chIdx",
+            bookId = longBookId,
+            chapterIndex = chIdx,
+            title = "Capítulo $chIdx",
+            contentText = longParagraph,
+            wordCount = 240,
+            characterCount = longParagraph.length,
+            estimatedMinutes = 2,
+            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
+            audioFilePath = null,
+          )
+        }
+      dao.insertBookWithChapters(
+        BookEntity(
+          id = longBookId,
+          title = "Obra Extensa",
+          author = "Autor Clásico",
+          language = "es",
+          publisher = "",
+          description = "",
+          coverImagePath = null,
+          sourceFileName = "extensa.epub",
+          selectedVoice = NarratorVoice.FEMALE.name,
+          totalChapters = chapterCount,
+          totalWords = 240 * chapterCount,
+          totalCharacters = longParagraph.length * chapterCount,
+          estimatedMinutes = 2 * chapterCount,
+          importedAt = 100L,
+        ),
+        chapters,
+      )
+
+      var synthCount = 0
+      val provider =
+        object : AudioSynthesisProvider {
+          override val isConfigured = true
+          override val providerName = "Piper VITS + sherpa-onnx (Local)"
+          override val modelId = "es_ES-sharvard-medium"
+
+          override suspend fun synthesizeFragment(
+            text: String,
+            voice: NarratorVoice,
+            bookTitle: String,
+            chapterTitle: String,
+          ): Result<SynthesizedAudioPayload> {
+            synthCount++
+            return Result.success(
+              SynthesizedAudioPayload(
+                bytes = ByteArray(4410) { (synthCount % 90).toByte() },
+                mimeType = "audio/L16;rate=22050;channels=1",
+                sampleRate = 22_050,
+              )
+            )
+          }
+        }
+
+      val orchestrator = AudiobookGenerationOrchestrator(dao, storageManager, provider)
+      val res = orchestrator.generateBookAudiobook(longBookId)
+      assertTrue(res.isSuccess)
+      val chunksPerChapter = ChapterTextChunker.splitChapter(longParagraph).size
+      assertTrue(chunksPerChapter >= 2)
+      assertEquals(chapterCount * chunksPerChapter, synthCount)
+
+      val readyChapters = dao.getChaptersOnce(longBookId)
+      assertTrue(readyChapters.all { it.audioStatus == AudioGenerationStatus.READY.name })
+      assertTrue(
+        readyChapters.all {
+          val info = WavAudioCodec.readWavInfo(File(it.audioFilePath!!))
+          info != null && info.sampleRate == 22_050
+        }
+      )
+      storageManager.deleteBookAudioFiles(longBookId)
+    }
 
   @Test
   fun `imported EPUB voice WAV file and resume position persist across database close and reopen`() =
@@ -679,47 +782,8 @@ class AudiobookPhase2RobolectricTest {
   }
 
   @Test
-  fun `getAppCheckDebugToken reads exact SDK StorageHelper secret without generating or overwriting`() {
-    if (com.google.firebase.FirebaseApp.getApps(context).isEmpty()) {
-      com.google.firebase.FirebaseApp.initializeApp(context)
-    }
-    val app = com.google.firebase.FirebaseApp.getInstance()
-    val prefsName = "com.google.firebase.appcheck.debug.store.${app.persistenceKey}"
-    val prefs = context.getSharedPreferences(prefsName, Context.MODE_PRIVATE)
-    prefs.edit().clear().commit()
-
-    assertNull(com.example.firebase.getAppCheckDebugToken(context))
-    assertNull(prefs.getString("com.google.firebase.appcheck.debug.DEBUG_SECRET", null))
-
-    val observed = mutableListOf<String?>()
-    val unregister = com.example.firebase.observeAppCheckDebugToken(context) { observed += it }
-    assertEquals(listOf<String?>(null), observed)
-
-    val sdkSecret = "11111111-2222-4333-8444-555555555555"
-    val storageHelper =
-      com.google.firebase.appcheck.debug.internal.StorageHelper(context, app.persistenceKey)
-    storageHelper.saveDebugSecret(sdkSecret)
-
-    assertEquals(sdkSecret, storageHelper.retrieveDebugSecret())
-    assertEquals(sdkSecret, com.example.firebase.getAppCheckDebugToken(context))
-    assertEquals(sdkSecret, observed.lastOrNull())
-    unregister()
-  }
-
-  @Test
-  fun `BookDetailScreen debug diagnostic shows unavailable state then displays and copies real SDK token`() =
+  fun `BookDetailScreen hides Firebase diagnostics and keeps local voice model indicator`() =
     runTest {
-      if (com.google.firebase.FirebaseApp.getApps(context).isEmpty()) {
-        com.google.firebase.FirebaseApp.initializeApp(context)
-      }
-      val app = com.google.firebase.FirebaseApp.getInstance()
-      val prefs =
-        context.getSharedPreferences(
-          "com.google.firebase.appcheck.debug.store.${app.persistenceKey}",
-          Context.MODE_PRIVATE,
-        )
-      prefs.edit().clear().commit()
-
       val dao = db.audiobookDao()
       insertSampleBook(dao, "book-1", NarratorVoice.FEMALE)
       val repo = AudiobookRepository(context, dao, storageManager = storageManager)
@@ -739,37 +803,22 @@ class AudiobookPhase2RobolectricTest {
       }
 
       composeRule.waitUntil(timeoutMillis = 5_000L) {
-        composeRule.onAllNodesWithTag("debug_appcheck_diagnostic_section").fetchSemanticsNodes().isNotEmpty() ||
-          composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
+        composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
       }
-
+      assertTrue(
+        composeRule
+          .onAllNodesWithTag("debug_appcheck_diagnostic_section")
+          .fetchSemanticsNodes()
+          .isEmpty()
+      )
       composeRule
         .onNode(hasScrollToNodeAction())
-        .performScrollToNode(hasTestTag("debug_appcheck_diagnostic_section"))
-      composeRule.onNodeWithTag("debug_appcheck_diagnostic_section").assertIsDisplayed()
-      composeRule.onNodeWithTag("debug_appcheck_token_unavailable").assertIsDisplayed()
+        .performScrollToNode(hasTestTag("detail_legal_notices_button"))
+      composeRule.onNodeWithText("100 % local sin conexión · es_ES-sharvard-medium").assertIsDisplayed()
 
-      val realSdkToken = "aaaaaaaa-bbbb-4ccc-8ddd-eeeeeeeeeeee"
-      val storageHelper =
-        com.google.firebase.appcheck.debug.internal.StorageHelper(context, app.persistenceKey)
-      storageHelper.saveDebugSecret(realSdkToken)
-
-      composeRule
-        .onNode(hasScrollToNodeAction())
-        .performScrollToNode(hasTestTag("refresh_debug_appcheck_token_button"))
-      composeRule.onNodeWithTag("refresh_debug_appcheck_token_button").performClick()
-
-      composeRule.waitUntil(timeoutMillis = 5_000L) {
-        composeRule.onAllNodesWithTag("debug_appcheck_token_value").fetchSemanticsNodes().isNotEmpty()
-      }
-      composeRule.onNodeWithTag("debug_appcheck_token_value").assertTextEquals(realSdkToken)
-      composeRule.onNodeWithTag("copy_debug_appcheck_token_button").performClick()
-      composeRule.waitForIdle()
-
-      val clipboard =
-        context.getSystemService(Context.CLIPBOARD_SERVICE) as android.content.ClipboardManager
-      assertEquals(realSdkToken, clipboard.primaryClip?.getItemAt(0)?.text?.toString())
+      controller.releaseForTesting()
       testPlayer.release()
     }
 }
+
 

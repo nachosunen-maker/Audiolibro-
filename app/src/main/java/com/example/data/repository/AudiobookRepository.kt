@@ -12,7 +12,7 @@ import com.example.data.storage.AudiobookStorageManager
 import com.example.domain.audio.AudioSynthesisProvider
 import com.example.domain.audio.AudiobookGenerationOrchestrator
 import com.example.domain.audio.BookGenerationProgress
-import com.example.domain.audio.FirebaseAiAudioSynthesisProvider
+import com.example.domain.audio.PiperAudioSynthesisProvider
 import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.Book
 import com.example.domain.model.BookWithChapters
@@ -43,7 +43,7 @@ class AudiobookRepository(
   private val dao: AudiobookDao,
   private val epubParser: EpubParser = EpubParser(),
   val storageManager: AudiobookStorageManager = AudiobookStorageManager(context),
-  val audioSynthesisProvider: AudioSynthesisProvider = FirebaseAiAudioSynthesisProvider(context),
+  val audioSynthesisProvider: AudioSynthesisProvider = PiperAudioSynthesisProvider(context),
 ) {
 
   private val orchestrator =
@@ -264,6 +264,10 @@ class AudiobookRepository(
       val current = map[bookId] ?: return@update map
       map + (bookId to current.copy(errorMessage = null))
     }
+  }
+
+  fun release() {
+    audioSynthesisProvider.release()
   }
 
   suspend fun getBookAudioStorageBytes(bookId: String): Long =

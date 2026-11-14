@@ -136,6 +136,7 @@ class AudiobookPhase3PlaybackRobolectricTest {
     assertTrue(permissions.contains(Manifest.permission.FOREGROUND_SERVICE))
     assertTrue(permissions.contains(Manifest.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK))
     assertTrue(permissions.contains(Manifest.permission.POST_NOTIFICATIONS))
+    assertFalse(permissions.contains(Manifest.permission.INTERNET))
     assertFalse(permissions.contains("android.permission.READ_PHONE_STATE"))
     assertFalse(permissions.contains("android.permission.BLUETOOTH_CONNECT"))
     assertFalse(permissions.contains("android.permission.READ_EXTERNAL_STORAGE"))

@@ -111,13 +111,14 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
 
     val vitsConfig =
       OfflineTtsVitsModelConfig(
-        model = "$ASSET_MODEL_DIR/$MODEL_FILENAME",
-        tokens = "$ASSET_MODEL_DIR/$TOKENS_FILENAME",
-        lexicon = "",
-        dataDir = espeakDataDir.absolutePath,
-        noiseScale = 0.667f,
-        noiseScaleW = 0.8f,
-        lengthScale = 1.0f,
+        /* model */ "$ASSET_MODEL_DIR/$MODEL_FILENAME",
+        /* lexicon */ "",
+        /* tokens */ "$ASSET_MODEL_DIR/$TOKENS_FILENAME",
+        /* dataDir */ espeakDataDir.absolutePath,
+        /* dictDir */ "",
+        /* noiseScale */ 0.667f,
+        /* noiseScaleW */ 0.8f,
+        /* lengthScale */ 1.0f,
       )
 
     val ttsConfig =
@@ -133,13 +134,22 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
         silenceScale = 0.25f,
       )
 
-    val engine = OfflineTts(assetManager = context.assets, config = ttsConfig)
+    val engine =
+      try {
+        OfflineTts(assetManager = context.assets, config = ttsConfig)
+      } catch (t: Throwable) {
+        throw IllegalStateException(
+          "Fallo crítico al inicializar OfflineTts con modelo $MODEL_ID y dataDir=${espeakDataDir.absolutePath}: ${t.message}",
+          t,
+        )
+      }
+
     val rate = engine.sampleRate()
     val speakers = engine.numSpeakers()
     if (rate <= 0 || speakers < 2) {
-      engine.release()
+      runCatching { engine.release() }
       error(
-        "El modelo local $MODEL_ID se inicializó con parámetros inválidos (sampleRate=$rate, speakers=$speakers)."
+        "El modelo local $MODEL_ID se inicializó con parámetros inválidos o corruptos (sampleRate=$rate, speakers=$speakers)."
       )
     }
     offlineTts = engine
@@ -153,8 +163,25 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
   override fun generate(text: String, speakerId: Int, speed: Float): LocalTtsAudio {
     val engine =
       offlineTts
-        ?: throw IllegalStateException("El motor local sherpa-onnx no está inicializado.")
-    val generated = engine.generate(text = text, sid = speakerId, speed = speed)
+        ?: throw IllegalStateException("El motor local sherpa-onnx no está inicializado (offlineTts == null).")
+    val cleanText = text.trim()
+    if (cleanText.isEmpty()) {
+      throw IllegalArgumentException("El texto de entrada para síntesis está vacío.")
+    }
+    val generated =
+      try {
+        engine.generate(text = cleanText, sid = speakerId, speed = speed)
+      } catch (e: Exception) {
+        throw IllegalStateException(
+          "Fallo de inferencia TTS en sherpa-onnx (speakerId=$speakerId, textLength=${cleanText.length}): ${e.message}",
+          e,
+        )
+      }
+    if (generated == null || generated.samples.isEmpty()) {
+      throw IllegalStateException(
+        "El motor local devolvió una estructura de audio nula o vacía (speakerId=$speakerId)."
+      )
+    }
     return LocalTtsAudio(samples = generated.samples, sampleRate = generated.sampleRate)
   }
 

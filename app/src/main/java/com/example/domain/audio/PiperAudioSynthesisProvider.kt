@@ -106,14 +106,20 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
       "Faltan los archivos locales del modelo $MODEL_ID en assets/$ASSET_MODEL_DIR."
     }
 
-    val espeakDataDir = ensureEspeakDataCopied(context)
+    val modelDir = ensureModelAssetsCopied(context)
+    val modelFile = File(modelDir, MODEL_FILENAME)
+    val tokensFile = File(modelDir, TOKENS_FILENAME)
+    val espeakDataDir = File(modelDir, ESPEAK_DIR_NAME)
+
+    Log.i(TAG, "Inicializando OfflineTts con rutas absolutas: model=${modelFile.absolutePath}, tokens=${tokensFile.absolutePath}, dataDir=${espeakDataDir.absolutePath}")
+
     val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
 
     val vitsConfig =
       OfflineTtsVitsModelConfig(
-        /* model */ "$ASSET_MODEL_DIR/$MODEL_FILENAME",
+        /* model */ modelFile.absolutePath,
         /* lexicon */ "",
-        /* tokens */ "$ASSET_MODEL_DIR/$TOKENS_FILENAME",
+        /* tokens */ tokensFile.absolutePath,
         /* dataDir */ espeakDataDir.absolutePath,
         /* dictDir */ "",
         /* noiseScale */ 0.667f,
@@ -204,7 +210,7 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
     const val CONFIG_FILENAME = "es_ES-sharvard-medium.onnx.json"
     const val TOKENS_FILENAME = "tokens.txt"
     const val ESPEAK_DIR_NAME = "espeak-ng-data"
-    private const val EXTRACTION_MARKER_FILE = ".espeak_ng_ready_v1"
+    private const val EXTRACTION_MARKER_FILE = ".model_extracted_ready_v2"
 
     fun hasBundledModelAssets(assets: AssetManager): Boolean {
       return assetExists(assets, "$ASSET_MODEL_DIR/$MODEL_FILENAME") &&
@@ -222,12 +228,15 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
         .getOrDefault(false)
     }
 
-    internal fun ensureEspeakDataCopied(context: Context): File {
-      val baseTargetDir = File(context.filesDir, "$ASSET_MODEL_DIR/$ESPEAK_DIR_NAME")
+    internal fun ensureModelAssetsCopied(context: Context): File {
+      val baseTargetDir = File(context.filesDir, ASSET_MODEL_DIR)
       val markerFile = File(baseTargetDir, EXTRACTION_MARKER_FILE)
-      val requiredEsDict = File(baseTargetDir, "es_dict")
-      val requiredPhontab = File(baseTargetDir, "phontab")
-      if (markerFile.exists() && requiredEsDict.exists() && requiredPhontab.exists()) {
+      val requiredModel = File(baseTargetDir, MODEL_FILENAME)
+      val requiredTokens = File(baseTargetDir, TOKENS_FILENAME)
+      val requiredEsDict = File(baseTargetDir, "$ESPEAK_DIR_NAME/es_dict")
+      val requiredPhontab = File(baseTargetDir, "$ESPEAK_DIR_NAME/phontab")
+
+      if (markerFile.exists() && requiredModel.exists() && requiredTokens.exists() && requiredEsDict.exists() && requiredPhontab.exists()) {
         return baseTargetDir
       }
 
@@ -238,15 +247,21 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
 
       copyAssetTree(
         assets = context.assets,
-        assetPath = "$ASSET_MODEL_DIR/$ESPEAK_DIR_NAME",
+        assetPath = ASSET_MODEL_DIR,
         targetDir = baseTargetDir,
       )
 
-      check(requiredEsDict.exists() && requiredPhontab.exists()) {
-        "No se pudieron extraer los datos fonéticos de eSpeak NG para $MODEL_ID."
+      check(requiredModel.exists() && requiredTokens.exists() && requiredEsDict.exists() && requiredPhontab.exists()) {
+        "No se pudieron extraer los archivos del modelo $MODEL_ID desde assets a ${baseTargetDir.absolutePath}."
       }
       markerFile.writeText("ok\n")
+      Log.i(TAG, "Archivos de modelo y eSpeak extraídos correctamente en ${baseTargetDir.absolutePath}")
       return baseTargetDir
+    }
+
+    internal fun ensureEspeakDataCopied(context: Context): File {
+      val modelDir = ensureModelAssetsCopied(context)
+      return File(modelDir, ESPEAK_DIR_NAME)
     }
 
     private fun copyAssetTree(assets: AssetManager, assetPath: String, targetDir: File) {

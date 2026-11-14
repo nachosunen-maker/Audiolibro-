@@ -4,6 +4,7 @@ import android.content.Context
 import android.content.res.AssetManager
 import android.util.Log
 import com.example.domain.model.NarratorVoice
+import com.k2fsa.sherpa.onnx.GenerationConfig
 import com.k2fsa.sherpa.onnx.OfflineTts
 import com.k2fsa.sherpa.onnx.OfflineTtsConfig
 import com.k2fsa.sherpa.onnx.OfflineTtsModelConfig
@@ -41,7 +42,7 @@ interface LocalTtsEngine {
 
   fun numSpeakers(): Int
 
-  fun generate(text: String, speakerId: Int, speed: Float = 1.0f): LocalTtsAudio
+  fun generate(text: String, speakerId: Int, speed: Float): LocalTtsAudio
 
   fun release()
 }
@@ -97,6 +98,7 @@ object PiperAudioPcmEncoder {
 class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
 
   @Volatile private var offlineTts: OfflineTts? = null
+  private val tokenMap = mutableMapOf<String, Int>()
 
   override fun isModelReady(): Boolean = hasBundledModelAssets(context.assets)
 
@@ -111,7 +113,13 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
     val tokensFile = File(modelDir, TOKENS_FILENAME)
     val espeakDataDir = File(modelDir, ESPEAK_DIR_NAME)
 
-    Log.i(TAG, "Inicializando OfflineTts con rutas absolutas: model=${modelFile.absolutePath}, tokens=${tokensFile.absolutePath}, dataDir=${espeakDataDir.absolutePath}")
+    tokenMap.clear()
+    tokenMap.putAll(parseTokensFile(tokensFile))
+
+    Log.i(
+      TAG,
+      "Inicializando OfflineTts con rutas absolutas y ${tokenMap.size} tokens: model=${modelFile.absolutePath}, tokens=${tokensFile.absolutePath}, dataDir=${espeakDataDir.absolutePath}"
+    )
 
     val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
 
@@ -159,7 +167,10 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
       )
     }
     offlineTts = engine
-    Log.i(TAG, "Piper VITS inicializado localmente: model=$MODEL_ID, rate=$rate Hz, speakers=$speakers, threads=$threads")
+    Log.i(
+      TAG,
+      "Piper VITS inicializado localmente: model=$MODEL_ID, rate=$rate Hz, speakers=$speakers, threads=$threads"
+    )
   }
 
   override fun sampleRate(): Int = offlineTts?.sampleRate() ?: DEFAULT_SAMPLE_RATE
@@ -174,15 +185,29 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
     if (cleanText.isEmpty()) {
       throw IllegalArgumentException("El texto de entrada para síntesis está vacío.")
     }
+
     val generated =
       try {
-        engine.generate(text = cleanText, sid = speakerId, speed = speed)
+        if (tokenMap.isNotEmpty()) {
+          val codepoints = textToTokenIds(cleanText, tokenMap)
+          val genConfig =
+            GenerationConfig(
+              silenceScale = 0.25f,
+              speed = speed,
+              sid = speakerId,
+              phonemeCodepoints = arrayOf(codepoints),
+            )
+          engine.generateWithConfig(cleanText, genConfig)
+        } else {
+          engine.generate(text = cleanText, sid = speakerId, speed = speed)
+        }
       } catch (e: Exception) {
         throw IllegalStateException(
           "Fallo de inferencia TTS en sherpa-onnx (speakerId=$speakerId, textLength=${cleanText.length}): ${e.message}",
           e,
         )
       }
+
     if (generated == null || generated.samples.isEmpty()) {
       throw IllegalStateException(
         "El motor local devolvió una estructura de audio nula o vacía (speakerId=$speakerId)."
@@ -210,7 +235,7 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
     const val CONFIG_FILENAME = "es_ES-sharvard-medium.onnx.json"
     const val TOKENS_FILENAME = "tokens.txt"
     const val ESPEAK_DIR_NAME = "espeak-ng-data"
-    private const val EXTRACTION_MARKER_FILE = ".model_extracted_ready_v2"
+    private const val EXTRACTION_MARKER_FILE = ".model_extracted_ready_v3"
 
     fun hasBundledModelAssets(assets: AssetManager): Boolean {
       return assetExists(assets, "$ASSET_MODEL_DIR/$MODEL_FILENAME") &&
@@ -228,6 +253,43 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
         .getOrDefault(false)
     }
 
+    internal fun parseTokensFile(tokensFile: File): Map<String, Int> {
+      val map = mutableMapOf<String, Int>()
+      if (!tokensFile.exists()) return map
+      tokensFile.bufferedReader().useLines { lines ->
+        for (line in lines) {
+          val lineEndTrimmed = line.trimEnd()
+          if (lineEndTrimmed.isEmpty()) continue
+          val lastSpace = lineEndTrimmed.lastIndexOf(' ')
+          if (lastSpace > 0) {
+            val symbol = lineEndTrimmed.substring(0, lastSpace)
+            val id = lineEndTrimmed.substring(lastSpace + 1).toIntOrNull()
+            if (id != null) {
+              map[symbol] = id
+            }
+          }
+        }
+      }
+      return map
+    }
+
+    internal fun textToTokenIds(text: String, tokenMap: Map<String, Int>): IntArray {
+      val ids = mutableListOf<Int>()
+      tokenMap["^"]?.let { ids.add(it) }
+      for (ch in text) {
+        val s = ch.toString()
+        if (tokenMap.containsKey(s)) {
+          ids.add(tokenMap[s]!!)
+        } else if (tokenMap.containsKey(ch.lowercaseChar().toString())) {
+          ids.add(tokenMap[ch.lowercaseChar().toString()]!!)
+        } else {
+          tokenMap[" "]?.let { ids.add(it) }
+        }
+      }
+      tokenMap["$"]?.let { ids.add(it) }
+      return ids.toIntArray()
+    }
+
     internal fun ensureModelAssetsCopied(context: Context): File {
       val baseTargetDir = File(context.filesDir, ASSET_MODEL_DIR)
       val markerFile = File(baseTargetDir, EXTRACTION_MARKER_FILE)
@@ -236,7 +298,18 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
       val requiredEsDict = File(baseTargetDir, "$ESPEAK_DIR_NAME/es_dict")
       val requiredPhontab = File(baseTargetDir, "$ESPEAK_DIR_NAME/phontab")
 
-      if (markerFile.exists() && requiredModel.exists() && requiredTokens.exists() && requiredEsDict.exists() && requiredPhontab.exists()) {
+      val isValid =
+        markerFile.exists() &&
+          requiredModel.exists() &&
+          requiredModel.length() > 50_000_000L &&
+          requiredTokens.exists() &&
+          requiredTokens.length() > 200L &&
+          requiredEsDict.exists() &&
+          requiredEsDict.length() > 1000L &&
+          requiredPhontab.exists() &&
+          requiredPhontab.length() > 1000L
+
+      if (isValid) {
         return baseTargetDir
       }
 
@@ -251,11 +324,24 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
         targetDir = baseTargetDir,
       )
 
-      check(requiredModel.exists() && requiredTokens.exists() && requiredEsDict.exists() && requiredPhontab.exists()) {
-        "No se pudieron extraer los archivos del modelo $MODEL_ID desde assets a ${baseTargetDir.absolutePath}."
+      val checkValid =
+        requiredModel.exists() &&
+          requiredModel.length() > 50_000_000L &&
+          requiredTokens.exists() &&
+          requiredTokens.length() > 200L &&
+          requiredEsDict.exists() &&
+          requiredEsDict.length() > 1000L &&
+          requiredPhontab.exists() &&
+          requiredPhontab.length() > 1000L
+
+      check(checkValid) {
+        "Extracción incompleta o corrupta de los archivos del modelo $MODEL_ID en ${baseTargetDir.absolutePath}."
       }
       markerFile.writeText("ok\n")
-      Log.i(TAG, "Archivos de modelo y eSpeak extraídos correctamente en ${baseTargetDir.absolutePath}")
+      Log.i(
+        TAG,
+        "Archivos de modelo y eSpeak extraídos y validados (tamaño e integridad) en ${baseTargetDir.absolutePath}"
+      )
       return baseTargetDir
     }
 
@@ -267,7 +353,6 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
     private fun copyAssetTree(assets: AssetManager, assetPath: String, targetDir: File) {
       val children = assets.list(assetPath).orEmpty()
       if (children.isEmpty()) {
-        // Leaf file (or empty directory)
         val inputStream =
           try {
             assets.open(assetPath)

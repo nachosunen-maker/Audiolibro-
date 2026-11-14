@@ -81,6 +81,26 @@ class PiperAudioSynthesisProviderTest {
   }
 
   @Test
+  fun `parseTokensFile and textToTokenIds correctly map symbols and generate codepoints`() {
+    val tempFile = tempFolder.newFile("tokens.txt")
+    tempFile.writeText("_ 0\n^ 1\n$ 2\n  3\na 14\nb 15\n")
+    val map = SherpaOnnxLocalTtsEngine.parseTokensFile(tempFile)
+    assertEquals(0, map["_"])
+    assertEquals(1, map["^"])
+    assertEquals(2, map["$"])
+    assertEquals(3, map[" "])
+    assertEquals(14, map["a"])
+    assertEquals(15, map["b"])
+
+    val ids = SherpaOnnxLocalTtsEngine.textToTokenIds("ab", map)
+    assertTrue(ids.isNotEmpty())
+    assertEquals(1, ids.first()) // ^ start symbol
+    assertEquals(2, ids.last())  // $ end symbol
+    assertTrue(ids.contains(14)) // a
+    assertTrue(ids.contains(15)) // b
+  }
+
+  @Test
   fun `floatSamplesToPcm16Le clamps extreme and NaN samples into valid 16-bit little endian PCM`() {
     val samples = floatArrayOf(-1.5f, -1.0f, 0.0f, Float.NaN, 1.0f, 1.5f)
     val bytes = PiperAudioPcmEncoder.floatSamplesToPcm16Le(samples)

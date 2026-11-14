@@ -2,6 +2,7 @@ package com.example.ui.viewmodel
 
 import android.content.Context
 import android.net.Uri
+import android.util.Log
 import androidx.lifecycle.SavedStateHandle
 import androidx.lifecycle.ViewModel
 import androidx.lifecycle.ViewModelProvider
@@ -155,6 +156,8 @@ class BookDetailViewModel(
   }
 
   fun generateAudiobook() {
+    Log.i("BookDetailVM", "generateAudiobook() invocado para bookId=$bookId")
+    repository.clearGenerationError(bookId)
     repository.startAudiobookGeneration(bookId)
   }
 

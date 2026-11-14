@@ -150,6 +150,11 @@ class AudiobookGenerationOrchestrator(
               )
             )
 
+            Log.i(
+              "AudioGenOrch",
+              "Sintetizando capítulo ${chapter.chapterIndex}, fragmento ${chunk.chunkIndex + 1}/$totalChunks (${chunk.textContent.length} chars, voz=${voice.name}, spk=${voice.speakerId})"
+            )
+
             val synthResult =
               synthesisProvider.synthesizeFragment(
                 text = chunk.textContent,
@@ -162,6 +167,7 @@ class AudiobookGenerationOrchestrator(
               synthResult.getOrElse { error ->
                 val msg =
                   error.localizedMessage ?: "Error al sintetizar el fragmento ${chunk.chunkIndex + 1}."
+                Log.e("AudioGenOrch", "Fallo al sintetizar fragmento ${chunk.chunkIndex + 1}: $msg", error)
                 dao.upsertChunk(chunk.copy(status = ChapterChunkStatus.ERROR.name))
                 dao.updateChapterAudioState(
                   chapterId = chapter.id,
@@ -188,6 +194,8 @@ class AudiobookGenerationOrchestrator(
                 return Result.failure(error)
               }
 
+            Log.i("AudioGenOrch", "Fragmento sintetizado (${payload.bytes.size} bytes PCM, ${payload.sampleRate} Hz). Escribiendo WAV en ${targetFile.name}...")
+
             val wavInfo =
               if (isAlreadyWavPayload(payload)) {
                 WavAudioCodec.writeVerifiedWavBytes(payload.bytes, targetFile)
@@ -200,6 +208,8 @@ class AudiobookGenerationOrchestrator(
                   bitsPerSample = payload.bitsPerSample,
                 )
               }
+
+            Log.i("AudioGenOrch", "WAV de fragmento generado: ${targetFile.name} (${wavInfo.durationMs} ms, ${targetFile.length()} bytes)")
 
             dao.upsertChunk(
               chunk.copy(
@@ -224,7 +234,9 @@ class AudiobookGenerationOrchestrator(
           }
 
           val finalChapterFile = storage.chapterWavFile(bookId, chapter.chapterIndex)
+          Log.i("AudioGenOrch", "Capítulo ${chapter.chapterIndex}: concatenando ${chunkFiles.size} fragmentos en ${finalChapterFile.name}...")
           val mergedInfo = WavAudioCodec.mergeWavFiles(chunkFiles, finalChapterFile)
+          Log.i("AudioGenOrch", "Capítulo ${chapter.chapterIndex} completado con éxito: ${finalChapterFile.name} (${mergedInfo.durationMs} ms, ${finalChapterFile.length()} bytes)")
           dao.updateChapterAudioState(
             chapterId = chapter.id,
             audioStatus = AudioGenerationStatus.READY.name,

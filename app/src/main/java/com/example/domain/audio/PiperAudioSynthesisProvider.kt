@@ -98,7 +98,6 @@ object PiperAudioPcmEncoder {
 class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
 
   @Volatile private var offlineTts: OfflineTts? = null
-  private val tokenMap = mutableMapOf<String, Int>()
 
   override fun isModelReady(): Boolean = hasBundledModelAssets(context.assets)
 
@@ -108,18 +107,17 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
       "Faltan los archivos locales del modelo $MODEL_ID en assets/$ASSET_MODEL_DIR."
     }
 
+    Log.i(TAG, "[Fase 1/4] Extrayendo y verificando archivos del modelo $MODEL_ID en almacenamiento interno...")
     val modelDir = ensureModelAssetsCopied(context)
     val modelFile = File(modelDir, MODEL_FILENAME)
     val tokensFile = File(modelDir, TOKENS_FILENAME)
-    val espeakDataDir = File(modelDir, ESPEAK_DIR_NAME)
 
-    tokenMap.clear()
-    tokenMap.putAll(parseTokensFile(tokensFile))
-
-    Log.i(
-      TAG,
-      "Inicializando OfflineTts con rutas absolutas y ${tokenMap.size} tokens: model=${modelFile.absolutePath}, tokens=${tokensFile.absolutePath}, dataDir=${espeakDataDir.absolutePath}"
-    )
+    check(modelFile.exists() && modelFile.length() > 50_000_000L) {
+      "El archivo de modelo ONNX no existe o está incompleto: ${modelFile.absolutePath} (${modelFile.length()} bytes)"
+    }
+    check(tokensFile.exists() && tokensFile.length() > 200L) {
+      "El archivo de tokens no existe o está incompleto: ${tokensFile.absolutePath} (${tokensFile.length()} bytes)"
+    }
 
     val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
 
@@ -128,7 +126,7 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
         /* model */ modelFile.absolutePath,
         /* lexicon */ "",
         /* tokens */ tokensFile.absolutePath,
-        /* dataDir */ espeakDataDir.absolutePath,
+        /* dataDir */ "",
         /* dictDir */ "",
         /* noiseScale */ 0.667f,
         /* noiseScaleW */ 0.8f,
@@ -148,18 +146,29 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
         silenceScale = 0.25f,
       )
 
+    Log.i(
+      TAG,
+      "[Fase 2/4] Instanciando OfflineTts(assetManager = null, config) con rutas absolutas: model=${modelFile.absolutePath}, tokens=${tokensFile.absolutePath}, threads=$threads"
+    )
+
+    // IMPORTANTE: assetManager DEBE ser null para invocar newFromFile(config) con rutas
+    // absolutas POSIX. Pasar context.assets provocaría newFromAsset, fallando en AAssetManager_open
+    // y causando un cierre inmediato (SIGSEGV nativo) de la aplicación.
     val engine =
       try {
-        OfflineTts(assetManager = context.assets, config = ttsConfig)
+        OfflineTts(assetManager = null, config = ttsConfig)
       } catch (t: Throwable) {
+        Log.e(TAG, "Fallo crítico al instanciar OfflineTts nativo con modelo $MODEL_ID", t)
         throw IllegalStateException(
-          "Fallo crítico al inicializar OfflineTts con modelo $MODEL_ID y dataDir=${espeakDataDir.absolutePath}: ${t.message}",
+          "Fallo crítico al inicializar OfflineTts con modelo $MODEL_ID: ${t.message}",
           t,
         )
       }
 
     val rate = engine.sampleRate()
     val speakers = engine.numSpeakers()
+    Log.i(TAG, "OfflineTts instanciado: sampleRate=$rate Hz, speakers=$speakers")
+
     if (rate <= 0 || speakers < 2) {
       runCatching { engine.release() }
       error(
@@ -169,7 +178,7 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
     offlineTts = engine
     Log.i(
       TAG,
-      "Piper VITS inicializado localmente: model=$MODEL_ID, rate=$rate Hz, speakers=$speakers, threads=$threads"
+      "Piper VITS listo para síntesis local: model=$MODEL_ID, rate=$rate Hz, speakers=$speakers, threads=$threads"
     )
   }
 
@@ -186,34 +195,89 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
       throw IllegalArgumentException("El texto de entrada para síntesis está vacío.")
     }
 
-    val generated =
+    Log.i(
+      TAG,
+      "[Fase 3/4] Preparación fonética española para texto de ${cleanText.length} caracteres (speakerId=$speakerId, speed=$speed)..."
+    )
+
+    val phonemeTokens = SpanishG2PPhonemizer.phonemizeToTokens(cleanText)
+    if (phonemeTokens.isEmpty()) {
+      throw IllegalStateException("El fonemizador no pudo extraer tokens fonéticos para el texto proporcionado.")
+    }
+
+    Log.i(
+      TAG,
+      "Fonemización completada: ${phonemeTokens.size} tokens generados. Primeros 30: ${phonemeTokens.take(30).joinToString("")}"
+    )
+
+    val tokenSentence = phonemeTokens.toTypedArray()
+
+    // 1. Intentar inferencia nativa con GenerationConfig.tokens (método estándar de sherpa-onnx 2.0+)
+    Log.i(TAG, "[Fase 4/4] Invocando inferencia nativa en sherpa-onnx con GenerationConfig.tokens (speakerId=$speakerId)...")
+    val genConfigTokens =
+      GenerationConfig(
+        silenceScale = 0.25f,
+        speed = speed,
+        sid = speakerId,
+        tokens = arrayOf(tokenSentence),
+      )
+
+    var generated =
       try {
-        if (tokenMap.isNotEmpty()) {
-          val codepoints = textToTokenIds(cleanText, tokenMap)
-          val genConfig =
-            GenerationConfig(
-              silenceScale = 0.25f,
-              speed = speed,
-              sid = speakerId,
-              phonemeCodepoints = arrayOf(codepoints),
-            )
-          engine.generateWithConfig(cleanText, genConfig)
-        } else {
-          engine.generate(text = cleanText, sid = speakerId, speed = speed)
-        }
+        engine.generateWithConfig(cleanText, genConfigTokens)
       } catch (e: Exception) {
-        throw IllegalStateException(
-          "Fallo de inferencia TTS en sherpa-onnx (speakerId=$speakerId, textLength=${cleanText.length}): ${e.message}",
-          e,
-        )
+        Log.w(TAG, "generateWithConfig con tokens falló: ${e.message}. Probando fallback con phonemeCodepoints...", e)
+        null
       }
 
+    // 2. Si tokens devolvió nulo o vacío, probar fallback con phonemeCodepoints (Unicode codepoints reales de fonemas IPA)
     if (generated == null || generated.samples.isEmpty()) {
-      throw IllegalStateException(
-        "El motor local devolvió una estructura de audio nula o vacía (speakerId=$speakerId)."
-      )
+      Log.i(TAG, "Fallback a phonemeCodepoints con codepoints Unicode de fonemas IPA...")
+      val codepoints = SpanishG2PPhonemizer.tokensToCodepoints(phonemeTokens)
+      val genConfigCodepoints =
+        GenerationConfig(
+          silenceScale = 0.25f,
+          speed = speed,
+          sid = speakerId,
+          phonemeCodepoints = arrayOf(codepoints),
+        )
+      generated =
+        try {
+          engine.generateWithConfig(cleanText, genConfigCodepoints)
+        } catch (e: Exception) {
+          Log.e(TAG, "Fallback con phonemeCodepoints también falló: ${e.message}", e)
+          null
+        }
     }
-    return LocalTtsAudio(samples = generated.samples, sampleRate = generated.sampleRate)
+
+    // 3. Si aún devolvió nulo o vacío, probar fallback a generate() estándar
+    if (generated == null || generated.samples.isEmpty()) {
+      Log.i(TAG, "Fallback final a generate(text, sid, speed)...")
+      generated =
+        try {
+          engine.generate(text = cleanText, sid = speakerId, speed = speed)
+        } catch (e: Exception) {
+          Log.e(TAG, "generate() estándar falló: ${e.message}", e)
+          null
+        }
+    }
+
+    if (generated == null || generated.samples.isEmpty()) {
+      val errMsg =
+        "El motor local devolvió una estructura de audio nula o vacía (speakerId=$speakerId, textLen=${cleanText.length}, phonemes=${phonemeTokens.size})."
+      Log.e(TAG, errMsg)
+      throw IllegalStateException(errMsg)
+    }
+
+    val sampleCount = generated.samples.size
+    val rate = generated.sampleRate
+    val durationSec = sampleCount.toFloat() / rate.toFloat()
+    Log.i(
+      TAG,
+      "Síntesis completada con éxito: $sampleCount muestras (${String.format(java.util.Locale.US, "%.2f", durationSec)}s) a $rate Hz (speakerId=$speakerId)"
+    )
+
+    return LocalTtsAudio(samples = generated.samples, sampleRate = rate)
   }
 
   override fun release() {
@@ -273,22 +337,7 @@ class SherpaOnnxLocalTtsEngine(private val context: Context) : LocalTtsEngine {
       return map
     }
 
-    internal fun textToTokenIds(text: String, tokenMap: Map<String, Int>): IntArray {
-      val ids = mutableListOf<Int>()
-      tokenMap["^"]?.let { ids.add(it) }
-      for (ch in text) {
-        val s = ch.toString()
-        if (tokenMap.containsKey(s)) {
-          ids.add(tokenMap[s]!!)
-        } else if (tokenMap.containsKey(ch.lowercaseChar().toString())) {
-          ids.add(tokenMap[ch.lowercaseChar().toString()]!!)
-        } else {
-          tokenMap[" "]?.let { ids.add(it) }
-        }
-      }
-      tokenMap["$"]?.let { ids.add(it) }
-      return ids.toIntArray()
-    }
+
 
     internal fun ensureModelAssetsCopied(context: Context): File {
       val baseTargetDir = File(context.filesDir, ASSET_MODEL_DIR)

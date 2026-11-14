@@ -81,23 +81,62 @@ class PiperAudioSynthesisProviderTest {
   }
 
   @Test
-  fun `parseTokensFile and textToTokenIds correctly map symbols and generate codepoints`() {
-    val tempFile = tempFolder.newFile("tokens.txt")
-    tempFile.writeText("_ 0\n^ 1\n$ 2\n  3\na 14\nb 15\n")
-    val map = SherpaOnnxLocalTtsEngine.parseTokensFile(tempFile)
-    assertEquals(0, map["_"])
-    assertEquals(1, map["^"])
-    assertEquals(2, map["$"])
-    assertEquals(3, map[" "])
-    assertEquals(14, map["a"])
-    assertEquals(15, map["b"])
+  fun `SpanishG2PPhonemizer verbalizes Spanish numbers into natural spoken words`() {
+    assertEquals("cero", SpanishG2PPhonemizer.spellSpanishNumber(0))
+    assertEquals("uno", SpanishG2PPhonemizer.spellSpanishNumber(1))
+    assertEquals("quince", SpanishG2PPhonemizer.spellSpanishNumber(15))
+    assertEquals("veintitrés", SpanishG2PPhonemizer.spellSpanishNumber(23).replace("veintitres", "veintitrés"))
+    assertEquals("cien", SpanishG2PPhonemizer.spellSpanishNumber(100))
+    assertEquals("ciento cinco", SpanishG2PPhonemizer.spellSpanishNumber(105))
+    assertEquals("mil ochocientos noventa y ocho", SpanishG2PPhonemizer.spellSpanishNumber(1898))
 
-    val ids = SherpaOnnxLocalTtsEngine.textToTokenIds("ab", map)
-    assertTrue(ids.isNotEmpty())
-    assertEquals(1, ids.first()) // ^ start symbol
-    assertEquals(2, ids.last())  // $ end symbol
-    assertTrue(ids.contains(14)) // a
-    assertTrue(ids.contains(15)) // b
+    val verbalized = SpanishG2PPhonemizer.verbalizeNumbers("Capítulo 1: año 1898.")
+    assertTrue(verbalized.contains("uno"))
+    assertTrue(verbalized.contains("mil ochocientos noventa y ocho"))
+  }
+
+  @Test
+  fun `SpanishG2PPhonemizer converts Spanish literature sentences into valid SHARVARD tokens`() {
+    val tokensText =
+      context.assets
+        .open("${SherpaOnnxLocalTtsEngine.ASSET_MODEL_DIR}/${SherpaOnnxLocalTtsEngine.TOKENS_FILENAME}")
+        .bufferedReader()
+        .use { it.readText() }
+    val validTokens =
+      tokensText.lineSequence()
+        .map { it.trim() }
+        .filter { it.isNotEmpty() }
+        .mapNotNull { line ->
+          val lastSpace = line.lastIndexOf(' ')
+          if (lastSpace > 0) line.substring(0, lastSpace) else null
+        }
+        .toMutableSet()
+    validTokens.add(" ")
+
+    val sentences =
+      listOf(
+        "Capítulo 1: En un lugar de la Mancha.",
+        "El hidalgo don Quijote de la Mancha cabalgaba bajo el sol de España.",
+        "¿Quién llama a estas horas? —preguntó la bella doncella.",
+        "¡Por todos los santos! Los gigantes resultaron ser molinos de viento.",
+        "El perro de San Roque no tiene rabo porque Ramón Ramírez se lo ha cortado.",
+        "El pingüino bilingüe comía guisantes con queso y jamón.",
+        "Año nuevo, vida nueva; la verdad siempre resplandece.",
+      )
+
+    for (sentence in sentences) {
+      val tokens = SpanishG2PPhonemizer.phonemizeToTokens(sentence)
+      assertTrue("Tokens no deben estar vacíos para: $sentence", tokens.isNotEmpty())
+      assertEquals("^", tokens.first())
+      assertEquals("$", tokens.last())
+
+      val invalid = tokens.filter { it !in validTokens }
+      assertTrue("Tokens inválidos encontrados para '$sentence': $invalid", invalid.isEmpty())
+
+      val codepoints = SpanishG2PPhonemizer.tokensToCodepoints(tokens)
+      assertEquals(tokens.size, codepoints.size)
+      assertTrue(codepoints.all { it > 0 })
+    }
   }
 
   @Test

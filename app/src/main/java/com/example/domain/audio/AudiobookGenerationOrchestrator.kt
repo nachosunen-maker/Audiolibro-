@@ -646,6 +646,12 @@ class AudiobookGenerationOrchestrator(
       if (alreadyComplete) {
         val dur = chapter.audioDurationMs.coerceAtLeast(WavAudioCodec.readWavInfo(existingFile!!)?.durationMs ?: 0L)
         val readyChunks = existingChunks.size.coerceAtLeast(chapter.totalChunks).coerceAtLeast(1)
+        val readyTotalChars =
+          if (existingChunks.isNotEmpty()) {
+            ProgressiveChapterProgressCalculator.calculateTotalChars(existingChunks)
+          } else {
+            chapter.characterCount.coerceAtLeast(chapter.contentText.length)
+          }
         onProgressiveState(
           ProgressiveChapterState(
             bookId = bookId,
@@ -671,10 +677,20 @@ class AudiobookGenerationOrchestrator(
             isSynthesizing = false,
             isCompleteChapterReady = true,
             statusMessage = "Audio preparado",
+            totalChapterChars = readyTotalChars,
+            synthesizedChapterChars = readyTotalChars,
           )
         )
         return Result.success(Unit)
       }
+
+      val initialTotalChars =
+        if (existingChunks.isNotEmpty()) {
+          ProgressiveChapterProgressCalculator.calculateTotalChars(existingChunks)
+        } else {
+          chapter.characterCount.coerceAtLeast(chapter.contentText.length)
+        }
+      val initialSynthesizedChars = ProgressiveChapterProgressCalculator.calculateSynthesizedChars(existingChunks)
 
       onProgressiveState(
         ProgressiveChapterState(
@@ -688,6 +704,8 @@ class AudiobookGenerationOrchestrator(
           deviceProfile = deviceProfile,
           isSynthesizing = true,
           statusMessage = "Preparando voz local",
+          totalChapterChars = initialTotalChars,
+          synthesizedChapterChars = initialSynthesizedChars,
         )
       )
 
@@ -714,6 +732,8 @@ class AudiobookGenerationOrchestrator(
             deviceProfile = deviceProfile,
             statusMessage = msg,
             errorMessage = msg,
+            totalChapterChars = 0,
+            synthesizedChapterChars = 0,
           )
         )
         return Result.failure(IllegalStateException(msg))
@@ -749,6 +769,9 @@ class AudiobookGenerationOrchestrator(
       while (true) {
         currentCoroutineContext().ensureActive()
 
+        val totalChars = ProgressiveChapterProgressCalculator.calculateTotalChars(chunks)
+        val synthesizedChars = ProgressiveChapterProgressCalculator.calculateSynthesizedChars(chunks)
+
         val contiguousReady = mutableListOf<ChapterChunkEntity>()
         for (chunk in chunks) {
           val ok =
@@ -782,6 +805,7 @@ class AudiobookGenerationOrchestrator(
           val chunkFiles = chunks.mapNotNull { it.wavFilePath?.let(::File) }
           val finalChapterFile = storage.chapterWavFile(bookId, chapter.chapterIndex)
           val mergedInfo = WavAudioCodec.mergeWavFiles(chunkFiles, finalChapterFile)
+          val isFinalWavValid = finalChapterFile.exists() && finalChapterFile.length() >= 44L && WavAudioCodec.isValidWavFile(finalChapterFile)
           val finalNow = System.currentTimeMillis()
           dao.updateChapterAudioState(
             chapterId = chapter.id,
@@ -828,8 +852,10 @@ class AudiobookGenerationOrchestrator(
               lastTelemetry = lastTelemetry,
               canStartPlayback = true,
               isSynthesizing = false,
-              isCompleteChapterReady = true,
+              isCompleteChapterReady = isFinalWavValid,
               statusMessage = "Audio preparado",
+              totalChapterChars = totalChars,
+              synthesizedChapterChars = if (isFinalWavValid) totalChars else synthesizedChars,
             )
           )
           return Result.success(Unit)
@@ -919,6 +945,8 @@ class AudiobookGenerationOrchestrator(
               isSynthesizing = false,
               isCompleteChapterReady = false,
               statusMessage = idleMessage,
+              totalChapterChars = totalChars,
+              synthesizedChapterChars = synthesizedChars,
             )
           )
 
@@ -980,6 +1008,8 @@ class AudiobookGenerationOrchestrator(
               isCompleteChapterReady = false,
               statusMessage = "Error de almacenamiento recuperable",
               errorMessage = msg,
+              totalChapterChars = totalChars,
+              synthesizedChapterChars = synthesizedChars,
             )
           )
           return Result.failure(java.io.IOException(msg))
@@ -1036,6 +1066,8 @@ class AudiobookGenerationOrchestrator(
             isSynthesizing = true,
             isCompleteChapterReady = false,
             statusMessage = activeStatusMsg,
+            totalChapterChars = totalChars,
+            synthesizedChapterChars = synthesizedChars,
           )
         )
 
@@ -1094,6 +1126,8 @@ class AudiobookGenerationOrchestrator(
                 isCompleteChapterReady = false,
                 statusMessage = "Error recuperable · puedes reintentar sin perder lo generado",
                 errorMessage = msg,
+                totalChapterChars = totalChars,
+                synthesizedChapterChars = synthesizedChars,
               )
             )
             return Result.failure(error)

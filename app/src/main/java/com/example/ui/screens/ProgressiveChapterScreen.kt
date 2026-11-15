@@ -260,17 +260,24 @@ internal fun ProgressiveChapterContent(
           horizontalArrangement = Arrangement.SpaceBetween,
           verticalAlignment = Alignment.CenterVertically,
         ) {
-          Text(
-            text = state.statusMessage.ifBlank { "Preparando voz local" },
-            style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
-            color =
-              if (state.phase == ProgressiveChapterPhase.RECOVERABLE_ERROR) {
-                MaterialTheme.colorScheme.error
-              } else {
-                MaterialTheme.colorScheme.primary
-              },
-            modifier = Modifier.weight(1f).testTag("progressive_status_text"),
-          )
+          Column(modifier = Modifier.weight(1f)) {
+            Text(
+              text = "Progreso de generación del capítulo",
+              style = MaterialTheme.typography.labelSmall,
+              color = MaterialTheme.colorScheme.onSurfaceVariant,
+            )
+            Text(
+              text = state.statusMessage.ifBlank { "Preparando voz local" },
+              style = MaterialTheme.typography.titleSmall.copy(fontWeight = FontWeight.SemiBold),
+              color =
+                if (state.phase == ProgressiveChapterPhase.RECOVERABLE_ERROR) {
+                  MaterialTheme.colorScheme.error
+                } else {
+                  MaterialTheme.colorScheme.primary
+                },
+              modifier = Modifier.testTag("progressive_status_text"),
+            )
+          }
           Text(
             text =
               if (state.canStartPlayback) {
@@ -309,7 +316,7 @@ internal fun ProgressiveChapterContent(
           Text(
             text =
               if (state.totalChunks > 0) {
-                "${state.chunksCompleted}/${state.totalChunks} fragmentos (${state.chapterPercent} % del capítulo)"
+                "${state.chunksCompleted}/${state.totalChunks} fragmentos (${state.chapterPercent} % de texto sintetizado)"
               } else {
                 "Calculando fragmentos del capítulo…"
               },

@@ -572,6 +572,8 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
         canStartPlayback = false,
         isSynthesizing = true,
         statusMessage = "Generando audio",
+        totalChapterChars = 1000,
+        synthesizedChapterChars = 100,
       )
 
     val stateHolder = androidx.compose.runtime.mutableStateOf(preparingState)
@@ -608,6 +610,7 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
         canStartPlayback = true,
         isSynthesizing = false,
         statusMessage = "Audio preparado",
+        synthesizedChapterChars = 300,
       )
 
     composeRule.runOnUiThread {

@@ -22,6 +22,7 @@ import com.example.domain.audio.BufferEvaluationInput
 import com.example.domain.audio.DeviceCapabilityInspector
 import com.example.domain.audio.GenerationPhase
 import com.example.domain.audio.PiperAudioSynthesisProvider
+import com.example.domain.audio.ProgressiveChapterProgressCalculator
 import com.example.domain.audio.ProgressiveChapterState
 import com.example.domain.audio.ProgressivePlaybackSnapshot
 import com.example.domain.audio.RtfEstimator
@@ -507,6 +508,19 @@ class AudiobookRepository(
       }
       val profile = DeviceCapabilityInspector.inspect(context)
       val existingChunks = dao.getChunksForChapterOnce(chapter.id).sortedBy { it.chunkIndex }
+      val totalChars =
+        if (existingChunks.isNotEmpty()) {
+          ProgressiveChapterProgressCalculator.calculateTotalChars(existingChunks)
+        } else {
+          chapter.characterCount.coerceAtLeast(chapter.contentText.length)
+        }
+      val isReady = chapter.audioStatus == AudioGenerationStatus.READY.name && !chapter.audioFilePath.isNullOrBlank()
+      val synthesizedChars =
+        if (isReady) {
+          totalChars
+        } else {
+          ProgressiveChapterProgressCalculator.calculateSynthesizedChars(existingChunks)
+        }
       val contiguousReady =
         existingChunks.takeWhile {
           it.status == ChapterChunkStatus.COMPLETED.name &&
@@ -515,7 +529,6 @@ class AudiobookRepository(
         }
       val bufferedMs = contiguousReady.sumOf { it.durationMs.coerceAtLeast(0L) }
       val totalChunks = chapter.totalChunks.coerceAtLeast(existingChunks.size)
-      val isReady = chapter.audioStatus == AudioGenerationStatus.READY.name && !chapter.audioFilePath.isNullOrBlank()
       val snap = progressivePlaybackSnapshot
       val playedMs = if (snap.bookId == bookId && snap.chapterIndex == chapterIndex) snap.playedPositionMs else book.lastPlayedPositionMs
       val aheadMs = (bufferedMs - playedMs).coerceAtLeast(0L)
@@ -580,6 +593,8 @@ class AudiobookRepository(
               else -> "Listo para preparar"
             },
           errorMessage = if (phase == ProgressiveChapterPhase.RECOVERABLE_ERROR) chapter.generationError else null,
+          totalChapterChars = totalChars,
+          synthesizedChapterChars = synthesizedChars,
         )
     }
   }

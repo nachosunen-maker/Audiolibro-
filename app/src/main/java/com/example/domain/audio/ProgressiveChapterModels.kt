@@ -1,6 +1,9 @@
 package com.example.domain.audio
 
+import com.example.data.local.ChapterChunkEntity
+import com.example.domain.model.ChapterChunkStatus
 import com.example.domain.model.ProgressiveChapterPhase
+import java.io.File
 import kotlin.math.roundToInt
 
 data class ProgressivePlaybackSnapshot(
@@ -10,6 +13,46 @@ data class ProgressivePlaybackSnapshot(
   val playedPositionMs: Long = 0L,
   val playbackSpeed: Float = 1.0f,
 )
+
+object ProgressiveChapterProgressCalculator {
+
+  fun isChunkValidAndCompleted(status: String, wavFilePath: String?): Boolean {
+    if (status != ChapterChunkStatus.COMPLETED.name || wavFilePath.isNullOrBlank()) return false
+    val file = File(wavFilePath)
+    return file.exists() && file.length() >= 44L && WavAudioCodec.isValidWavFile(file)
+  }
+
+  fun calculateSynthesizedChars(chunks: List<ChapterChunkEntity>): Int {
+    return chunks
+      .filter { isChunkValidAndCompleted(it.status, it.wavFilePath) }
+      .sumOf { it.textContent.length }
+  }
+
+  fun calculateTotalChars(chunks: List<ChapterChunkEntity>): Int {
+    return chunks.sumOf { it.textContent.length }
+  }
+
+  fun calculateProgressFraction(
+    totalChars: Int,
+    synthesizedChars: Int,
+    isCompleteChapterReady: Boolean,
+  ): Float {
+    if (isCompleteChapterReady) return 1f
+    if (totalChars <= 0 || synthesizedChars <= 0) return 0f
+    return (synthesizedChars.toFloat() / totalChars.toFloat()).coerceIn(0f, 1f)
+  }
+
+  fun calculateChapterPercent(
+    totalChars: Int,
+    synthesizedChars: Int,
+    isCompleteChapterReady: Boolean,
+  ): Int {
+    if (isCompleteChapterReady) return 100
+    if (totalChars <= 0 || synthesizedChars <= 0) return 0
+    val rawPercent = (synthesizedChars.toDouble() / totalChars.toDouble() * 100.0).roundToInt()
+    return rawPercent.coerceIn(0, 99)
+  }
+}
 
 data class ProgressiveChapterState(
   val bookId: String,
@@ -41,16 +84,18 @@ data class ProgressiveChapterState(
   val synthesizedChapterChars: Int = 0,
 ) {
   val overallChapterProgressFraction: Float
-    get() =
-      when {
-        isCompleteChapterReady || phase == ProgressiveChapterPhase.COMPLETED -> 1f
-        totalChapterChars > 0 -> (synthesizedChapterChars.toFloat() / totalChapterChars.toFloat()).coerceIn(0f, 1f)
-        totalChunks > 0 -> (chunksCompleted.toFloat() / totalChunks.toFloat()).coerceIn(0f, 1f)
-        else -> 0f
-      }
+    get() = ProgressiveChapterProgressCalculator.calculateProgressFraction(
+      totalChars = totalChapterChars,
+      synthesizedChars = synthesizedChapterChars,
+      isCompleteChapterReady = isCompleteChapterReady || phase == ProgressiveChapterPhase.COMPLETED,
+    )
 
   val chapterPercent: Int
-    get() = (overallChapterProgressFraction * 100f).roundToInt().coerceIn(0, 100)
+    get() = ProgressiveChapterProgressCalculator.calculateChapterPercent(
+      totalChars = totalChapterChars,
+      synthesizedChars = synthesizedChapterChars,
+      isCompleteChapterReady = isCompleteChapterReady || phase == ProgressiveChapterPhase.COMPLETED,
+    )
 
   val initialReadinessPercent: Int
     get() =

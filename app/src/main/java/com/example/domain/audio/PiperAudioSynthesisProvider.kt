@@ -23,11 +23,16 @@ import kotlinx.coroutines.withContext
 data class LocalTtsAudio(
   val samples: FloatArray,
   val sampleRate: Int,
+  val phonemizationMs: Long = 0L,
+  val inferenceMs: Long = 0L,
 ) {
   override fun equals(other: Any?): Boolean {
     if (this === other) return true
     if (other !is LocalTtsAudio) return false
-    return sampleRate == other.sampleRate && samples.contentEquals(other.samples)
+    return sampleRate == other.sampleRate &&
+      phonemizationMs == other.phonemizationMs &&
+      inferenceMs == other.inferenceMs &&
+      samples.contentEquals(other.samples)
   }
 
   override fun hashCode(): Int = 31 * samples.contentHashCode() + sampleRate
@@ -234,7 +239,9 @@ class SherpaOnnxLocalTtsEngine(
       "[Fase 4/5] Preparación fonética eSpeak NG (voice=\"$modelLang\", speakerId=$speakerId, speed=$speed, chars=${cleanText.length})...",
     )
 
+    val tPhonStartNs = System.nanoTime()
     val phonemeSentences = phonemizer.phonemizeToCodepoints(cleanText, modelLang)
+    val phonemizeElapsedMs = ((System.nanoTime() - tPhonStartNs) / 1_000_000L).coerceAtLeast(0L)
     if (phonemeSentences.isEmpty() || phonemeSentences.all { it.isEmpty() }) {
       throw IllegalStateException(
         "El fonemizador nativo eSpeak NG no generó secuencias de codepoints IPA válidas."
@@ -244,7 +251,7 @@ class SherpaOnnxLocalTtsEngine(
     val totalCodepoints = phonemeSentences.sumOf { it.size }
     Log.i(
       TAG,
-      "Fonemización eSpeak NG completada: ${phonemeSentences.size} oraciones/lotes, $totalCodepoints codepoints IPA. " +
+      "Fonemización eSpeak NG completada en $phonemizeElapsedMs ms: ${phonemeSentences.size} oraciones/lotes, $totalCodepoints codepoints IPA. " +
         "Invocando generateWithConfig(text=\"\", sid=$speakerId, phonemeCodepoints=${phonemeSentences.size})...",
     )
 
@@ -258,6 +265,7 @@ class SherpaOnnxLocalTtsEngine(
         phonemeCodepoints = phonemeSentences.toTypedArray(),
       )
 
+    val tInferStartNs = System.nanoTime()
     val generated =
       try {
         engine.generateWithConfig(text = "", config = genConfig)
@@ -272,6 +280,7 @@ class SherpaOnnxLocalTtsEngine(
           t,
         )
       }
+    val inferenceElapsedMs = ((System.nanoTime() - tInferStartNs) / 1_000_000L).coerceAtLeast(0L)
 
     if (generated.samples.isEmpty()) {
       val errMsg =
@@ -285,10 +294,15 @@ class SherpaOnnxLocalTtsEngine(
     val durationSec = sampleCount.toFloat() / rate.coerceAtLeast(1).toFloat()
     Log.i(
       TAG,
-      "[Fase 5/5] Inferencia completada: $sampleCount muestras (${String.format(java.util.Locale.US, "%.2f", durationSec)} s) a $rate Hz (speakerId=$speakerId)",
+      "[Fase 5/5] Inferencia completada en $inferenceElapsedMs ms: $sampleCount muestras (${String.format(java.util.Locale.US, "%.2f", durationSec)} s) a $rate Hz (speakerId=$speakerId)",
     )
 
-    return LocalTtsAudio(samples = generated.samples, sampleRate = rate)
+    return LocalTtsAudio(
+      samples = generated.samples,
+      sampleRate = rate,
+      phonemizationMs = phonemizeElapsedMs,
+      inferenceMs = inferenceElapsedMs,
+    )
   }
 
   override fun release() {
@@ -496,8 +510,11 @@ class PiperAudioSynthesisProvider(
         currentCoroutineContext().ensureActive()
         mutex.withLock {
           currentCoroutineContext().ensureActive()
+          var initMs = 0L
           if (!initialized) {
+            val tInitStartNs = System.nanoTime()
             engine.initialize()
+            initMs = ((System.nanoTime() - tInitStartNs) / 1_000_000L).coerceAtLeast(0L)
             initialized = true
           }
 
@@ -509,8 +526,11 @@ class PiperAudioSynthesisProvider(
               )
             )
           } else {
+            val tSynthWallStartNs = System.nanoTime()
             val generated =
               engine.generate(text = preparedText, speakerId = voice.speakerId, speed = 1.0f)
+            val totalGenerateWallMs =
+              ((System.nanoTime() - tSynthWallStartNs) / 1_000_000L).coerceAtLeast(0L)
             currentCoroutineContext().ensureActive()
 
             if (generated.samples.isEmpty()) {
@@ -522,7 +542,16 @@ class PiperAudioSynthesisProvider(
                 if (generated.sampleRate > 0) generated.sampleRate
                 else engine.sampleRate().takeIf { it > 0 } ?: SherpaOnnxLocalTtsEngine.DEFAULT_SAMPLE_RATE
 
+              val tPcmStartNs = System.nanoTime()
               val pcmBytes = PiperAudioPcmEncoder.floatSamplesToPcm16Le(generated.samples)
+              val pcmEncodeMs = ((System.nanoTime() - tPcmStartNs) / 1_000_000L).coerceAtLeast(0L)
+              val audioDurationMs =
+                (generated.samples.size.toLong() * 1000L) / sampleRate.coerceAtLeast(1).toLong()
+              val resolvedPhonemizeMs = generated.phonemizationMs
+              val resolvedInferenceMs =
+                if (generated.inferenceMs > 0L) generated.inferenceMs
+                else (totalGenerateWallMs - resolvedPhonemizeMs).coerceAtLeast(0L)
+
               Result.success(
                 SynthesizedAudioPayload(
                   bytes = pcmBytes,
@@ -530,6 +559,16 @@ class PiperAudioSynthesisProvider(
                   sampleRate = sampleRate,
                   channels = WavAudioCodec.DEFAULT_CHANNELS,
                   bitsPerSample = WavAudioCodec.DEFAULT_BITS_PER_SAMPLE,
+                  telemetry =
+                    SynthesisTelemetry(
+                      initializationMs = initMs,
+                      phonemizationMs = resolvedPhonemizeMs,
+                      inferenceMs = resolvedInferenceMs,
+                      pcmEncodingMs = pcmEncodeMs,
+                      audioDurationMs = audioDurationMs,
+                      sampleCount = generated.samples.size,
+                      textChars = preparedText.length,
+                    ),
                 )
               )
             }

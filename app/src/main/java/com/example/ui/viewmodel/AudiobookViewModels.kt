@@ -12,6 +12,8 @@ import androidx.lifecycle.viewmodel.CreationExtras
 import com.example.data.repository.AudiobookRepository
 import com.example.domain.audio.AudioSynthesisProvider
 import com.example.domain.audio.BookGenerationProgress
+import com.example.domain.audio.ProgressiveChapterState
+import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.Book
 import com.example.domain.model.BookWithChapters
 import com.example.domain.model.Chapter
@@ -319,10 +321,65 @@ class ChapterReaderViewModel(
   }
 }
 
+class ProgressiveChapterViewModel(
+  private val bookId: String,
+  private val chapterIndex: Int,
+  private val repository: AudiobookRepository,
+  private val playbackController: AudiobookPlaybackController,
+) : ViewModel() {
+
+  val state: StateFlow<ProgressiveChapterState?> = repository.progressiveChapterState
+  val playbackState: StateFlow<PlaybackUiState> = playbackController.uiState
+
+  init {
+    playbackController.ensureConnected()
+    repository.startProgressiveChapterLoading(bookId, chapterIndex, resetUserPause = true)
+  }
+
+  fun playReadyChapter(onNavigateToPlayer: () -> Unit) {
+    val current = state.value
+    if (current != null && !current.canStartPlayback) return
+    if (current?.isCompleteChapterReady == true) {
+      viewModelScope.launch {
+        val loaded = repository.getBookWithChaptersOnce(bookId) ?: return@launch
+        val savedPos =
+          if (loaded.book.lastPlayedChapterIndex == chapterIndex) {
+            loaded.book.lastPlayedPositionMs
+          } else {
+            0L
+          }
+        playbackController.playBook(
+          book = loaded.book,
+          chapters = loaded.chapters,
+          startChapterIndex = chapterIndex,
+          startPositionMs = savedPos,
+        )
+        onNavigateToPlayer()
+      }
+    } else {
+      playbackController.playProgressiveChapter(bookId = bookId, chapterIndex = chapterIndex)
+      onNavigateToPlayer()
+    }
+  }
+
+  fun pauseGeneration() {
+    repository.pauseProgressiveGeneration(userPaused = true)
+  }
+
+  fun resumeOrRetryGeneration() {
+    repository.resumeProgressiveGeneration(bookId, chapterIndex)
+  }
+
+  override fun onCleared() {
+    repository.onProgressiveUiExited()
+    super.onCleared()
+  }
+}
+
 class PlayerViewModel(
   private val bookId: String,
   private val startChapterIndex: Int?,
-  repository: AudiobookRepository,
+  private val repository: AudiobookRepository,
   private val playbackController: AudiobookPlaybackController,
   private val savedStateHandle: SavedStateHandle? = null,
 ) : ViewModel() {
@@ -337,6 +394,7 @@ class PlayerViewModel(
       )
 
   val playbackState: StateFlow<PlaybackUiState> = playbackController.uiState
+  val progressiveState: StateFlow<ProgressiveChapterState?> = repository.progressiveChapterState
 
   private var autoStartedFallback = false
   private var autoStarted: Boolean
@@ -351,7 +409,18 @@ class PlayerViewModel(
     viewModelScope.launch {
       combine(bookWithChapters, playbackController.uiState) { data, state -> data to state }
         .collect { (data, state) ->
-          if (autoStarted || data == null || !state.isConnected) return@collect
+          if (data == null || !state.isConnected) return@collect
+
+          if (autoStarted) {
+            val chIdx = state.currentChapterIndex
+            if (chIdx != null && repository.progressiveChapterState.value?.chapterIndex != chIdx) {
+              val chap = data.chapters.firstOrNull { it.chapterIndex == chIdx }
+              if (chap != null && chap.audioStatus != AudioGenerationStatus.READY && chap.generatedChunks > 0) {
+                repository.hydrateProgressiveChapterPreview(bookId, chIdx)
+              }
+            }
+            return@collect
+          }
 
           val alreadyLoadedInPlayer =
             state.activeBookId == bookId && playbackController.hasActiveMediaInPlayer()
@@ -359,17 +428,26 @@ class PlayerViewModel(
             startChapterIndex == null || state.currentChapterIndex == startChapterIndex
 
           if (alreadyLoadedInPlayer && matchesRequestedChapter) {
-            // Reconnected to active playback in AudiobookPlaybackService: resume cleanly without resetting position.
             autoStarted = true
           } else if (alreadyLoadedInPlayer && savedStateHandle?.contains(KEY_AUTO_STARTED) == true) {
             autoStarted = true
           } else {
             autoStarted = true
-            playbackController.playBook(
-              book = data.book,
-              chapters = data.chapters,
-              startChapterIndex = startChapterIndex,
-            )
+            val targetIdx = startChapterIndex ?: data.book.lastPlayedChapterIndex
+            val targetChap = data.chapters.firstOrNull { it.chapterIndex == targetIdx }
+            if (targetChap != null &&
+              targetChap.audioStatus != AudioGenerationStatus.READY &&
+              targetChap.generatedChunks > 0
+            ) {
+              repository.hydrateProgressiveChapterPreview(bookId, targetChap.chapterIndex)
+              playbackController.playProgressiveChapter(bookId, targetChap.chapterIndex)
+            } else {
+              playbackController.playBook(
+                book = data.book,
+                chapters = data.chapters,
+                startChapterIndex = startChapterIndex,
+              )
+            }
           }
         }
     }
@@ -387,17 +465,41 @@ class PlayerViewModel(
 
   fun previousChapter() = playbackController.previousChapter()
 
+  fun setPlaybackSpeed(speed: Float) = playbackController.setPlaybackSpeed(speed)
+
+  fun pauseLookaheadGeneration() = repository.pauseProgressiveGeneration(userPaused = true)
+
+  fun resumeLookaheadGeneration() {
+    val chIdx = playbackController.uiState.value.currentChapterIndex ?: startChapterIndex ?: return
+    repository.resumeProgressiveGeneration(bookId, chIdx)
+  }
+
   fun jumpToChapter(chapterIndex: Int) {
     val state = playbackController.uiState.value
-    if (state.activeBookId == bookId && playbackController.hasActiveMediaInPlayer()) {
+    if (state.activeBookId == bookId &&
+      !state.isProgressiveActive &&
+      playbackController.hasActiveMediaInPlayer() &&
+      state.playlistChapters.any { it.chapterIndex == chapterIndex }
+    ) {
       playbackController.jumpToChapter(chapterIndex)
     } else {
       val data = bookWithChapters.value ?: return
-      playbackController.playBook(data.book, data.chapters, startChapterIndex = chapterIndex, startPositionMs = 0L)
+      val target = data.chapters.firstOrNull { it.chapterIndex == chapterIndex }
+      if (target != null && target.audioStatus != AudioGenerationStatus.READY && target.generatedChunks > 0) {
+        viewModelScope.launch { repository.hydrateProgressiveChapterPreview(bookId, chapterIndex) }
+        playbackController.playProgressiveChapter(bookId, chapterIndex, startPositionMs = 0L)
+      } else {
+        playbackController.playBook(data.book, data.chapters, startChapterIndex = chapterIndex, startPositionMs = 0L)
+      }
     }
   }
 
   fun clearError() = playbackController.clearError()
+
+  override fun onCleared() {
+    repository.onProgressiveUiExited()
+    super.onCleared()
+  }
 
   companion object {
     private const val KEY_AUTO_STARTED = "player_initial_auto_started"
@@ -428,6 +530,13 @@ class AudiobookViewModelFactory(
         BookDetailViewModel(requireNotNull(bookId), repository, playbackController) as T
       modelClass.isAssignableFrom(ChapterReaderViewModel::class.java) ->
         ChapterReaderViewModel(requireNotNull(bookId), initialChapterIndex, repository) as T
+      modelClass.isAssignableFrom(ProgressiveChapterViewModel::class.java) ->
+        ProgressiveChapterViewModel(
+          requireNotNull(bookId),
+          initialChapterIndex,
+          repository,
+          playbackController,
+        ) as T
       modelClass.isAssignableFrom(PlayerViewModel::class.java) -> {
         val savedStateHandle = runCatching { extras.createSavedStateHandle() }.getOrNull()
         PlayerViewModel(

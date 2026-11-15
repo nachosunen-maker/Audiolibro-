@@ -108,6 +108,7 @@ fun BookDetailScreen(
   viewModel: BookDetailViewModel,
   onNavigateBack: () -> Unit,
   onOpenChapterText: (bookId: String, chapterIndex: Int) -> Unit,
+  onLoadChapter: (bookId: String, chapterIndex: Int) -> Unit = { _, _ -> },
   onOpenPlayer: (bookId: String, startChapterIndex: Int?) -> Unit,
 ) {
   val uiState by viewModel.uiState.collectAsStateWithLifecycle()
@@ -335,6 +336,7 @@ fun BookDetailScreen(
                   ChapterItemCard(
                     chapter = chapter,
                     onOpenText = { onOpenChapterText(book.id, chapter.chapterIndex) },
+                    onLoadChapter = { onLoadChapter(book.id, chapter.chapterIndex) },
                     onListenChapter = {
                       viewModel.playChapter(chapter.chapterIndex)
                       onOpenPlayer(book.id, chapter.chapterIndex)
@@ -981,7 +983,7 @@ private fun AudiobookGenerationSection(
           }
         }
 
-        if (readyCount > 0) {
+        if (readyCount > 0 || hasPartialChunks) {
           val resumeLabel =
             if (book.lastPlayedChapterIndex != null) {
               "Continuar Cap. ${book.lastPlayedChapterIndex}"
@@ -1089,11 +1091,13 @@ private fun StorageAndExportCard(
 private fun ChapterItemCard(
   chapter: Chapter,
   onOpenText: () -> Unit,
+  onLoadChapter: () -> Unit,
   onListenChapter: () -> Unit,
   onExportChapter: () -> Unit,
 ) {
   val isReady =
     chapter.audioStatus == AudioGenerationStatus.READY && !chapter.audioFilePath.isNullOrBlank()
+  val hasPartialChunks = chapter.generatedChunks > 0
 
   Card(
     onClick = onOpenText,
@@ -1194,6 +1198,42 @@ private fun ChapterItemCard(
               )
               Spacer(modifier = Modifier.width(4.dp))
               Text("Escuchar", style = MaterialTheme.typography.labelMedium)
+            }
+          }
+        } else {
+          Row(horizontalArrangement = Arrangement.spacedBy(6.dp)) {
+            OutlinedButton(
+              onClick = onLoadChapter,
+              modifier = Modifier.height(40.dp).testTag("load_chapter_${chapter.chapterIndex}"),
+              contentPadding = PaddingValues(horizontal = 10.dp, vertical = 0.dp),
+            ) {
+              Icon(
+                imageVector = Icons.Outlined.GraphicEq,
+                contentDescription = null,
+                modifier = Modifier.size(16.dp),
+              )
+              Spacer(modifier = Modifier.width(4.dp))
+              Text(
+                text =
+                  if (hasPartialChunks) stringResource(R.string.progressive_continue_chapter_action)
+                  else stringResource(R.string.progressive_load_chapter_action),
+                style = MaterialTheme.typography.labelMedium,
+              )
+            }
+            if (hasPartialChunks) {
+              Button(
+                onClick = onListenChapter,
+                modifier = Modifier.height(40.dp).testTag("play_chapter_${chapter.chapterIndex}"),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 0.dp),
+              ) {
+                Icon(
+                  imageVector = Icons.Outlined.PlayArrow,
+                  contentDescription = null,
+                  modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Escuchar", style = MaterialTheme.typography.labelMedium)
+              }
             }
           }
         }

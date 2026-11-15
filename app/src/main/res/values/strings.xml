@@ -25,4 +25,8 @@
     <string name="action_next_chapter">Siguiente</string>
     <string name="notification_channel_playback">Reproducción de audiolibros</string>
     <string name="notification_channel_generation">Generación de audiolibros</string>
+    <string name="progressive_loading_title">Cargando capítulo</string>
+    <string name="progressive_load_chapter_action">Cargar capítulo</string>
+    <string name="progressive_continue_chapter_action">Continuar carga</string>
+    <string name="progressive_ahead_hint">La generación continúa por adelantado durante la reproducción.</string>
 </resources>

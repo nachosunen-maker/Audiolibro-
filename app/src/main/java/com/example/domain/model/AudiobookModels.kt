@@ -72,6 +72,27 @@ enum class GenerationTaskStatus {
   }
 }
 
+enum class GenerationMode {
+  FULL_BOOK,
+  PROGRESSIVE_CHAPTER;
+
+  companion object {
+    fun fromNameOrDefault(raw: String?): GenerationMode =
+      entries.firstOrNull { it.name == raw } ?: FULL_BOOK
+  }
+}
+
+enum class ProgressiveChapterPhase {
+  IDLE,
+  PREPARING_VOICE,
+  GENERATING_BUFFER,
+  READY_TO_PLAY,
+  PLAYING_LOOKAHEAD,
+  PAUSED,
+  COMPLETED,
+  RECOVERABLE_ERROR,
+}
+
 data class Book(
   val id: String,
   val title: String,

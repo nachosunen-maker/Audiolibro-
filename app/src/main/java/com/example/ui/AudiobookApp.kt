@@ -13,22 +13,28 @@ import com.example.ui.screens.AudiobookPlayerScreen
 import com.example.ui.screens.BookDetailScreen
 import com.example.ui.screens.ChapterReaderScreen
 import com.example.ui.screens.LibraryScreen
+import com.example.ui.screens.ProgressiveChapterScreen
 import com.example.ui.viewmodel.AudiobookViewModelFactory
 import com.example.ui.viewmodel.BookDetailViewModel
 import com.example.ui.viewmodel.ChapterReaderViewModel
 import com.example.ui.viewmodel.LibraryViewModel
 import com.example.ui.viewmodel.PlayerViewModel
+import com.example.ui.viewmodel.ProgressiveChapterViewModel
 
 object Routes {
   const val LIBRARY = "library"
   const val BOOK_DETAIL = "book/{bookId}"
   const val CHAPTER_READER = "book/{bookId}/chapter/{chapterIndex}"
+  const val CHAPTER_LOADER = "book/{bookId}/load/{chapterIndex}"
   const val PLAYER = "book/{bookId}/player?chapterIndex={chapterIndex}"
 
   fun bookDetail(bookId: String): String = "book/${Uri.encode(bookId)}"
 
   fun chapterReader(bookId: String, chapterIndex: Int): String =
     "book/${Uri.encode(bookId)}/chapter/$chapterIndex"
+
+  fun chapterLoader(bookId: String, chapterIndex: Int): String =
+    "book/${Uri.encode(bookId)}/load/$chapterIndex"
 
   fun player(bookId: String, startChapterIndex: Int? = null): String {
     val idx = startChapterIndex ?: -1
@@ -65,8 +71,41 @@ fun AudiobookApp() {
         onOpenChapterText = { id, chapterIndex ->
           navController.navigate(Routes.chapterReader(id, chapterIndex))
         },
+        onLoadChapter = { id, chapterIndex ->
+          navController.navigate(Routes.chapterLoader(id, chapterIndex))
+        },
         onOpenPlayer = { id, startChapterIndex ->
           navController.navigate(Routes.player(id, startChapterIndex))
+        },
+      )
+    }
+
+    composable(
+      route = Routes.CHAPTER_LOADER,
+      arguments =
+        listOf(
+          navArgument("bookId") { type = NavType.StringType },
+          navArgument("chapterIndex") { type = NavType.IntType },
+        ),
+    ) { backStackEntry ->
+      val bookId = backStackEntry.arguments?.getString("bookId").orEmpty()
+      val chapterIndex = backStackEntry.arguments?.getInt("chapterIndex") ?: 1
+      val viewModel: ProgressiveChapterViewModel =
+        viewModel(
+          factory =
+            AudiobookViewModelFactory(
+              context = context,
+              bookId = bookId,
+              initialChapterIndex = chapterIndex,
+            )
+        )
+      ProgressiveChapterScreen(
+        viewModel = viewModel,
+        onNavigateBack = { navController.popBackStack() },
+        onOpenPlayer = { id, chIdx ->
+          navController.navigate(Routes.player(id, chIdx)) {
+            popUpTo(Routes.bookDetail(id)) { inclusive = false }
+          }
         },
       )
     }

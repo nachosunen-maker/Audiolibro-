@@ -37,9 +37,19 @@ interface AudiobookDao {
   fun observeChapter(bookId: String, chapterIndex: Int): Flow<ChapterEntity?>
 
   @Query(
+    "SELECT * FROM chapters WHERE bookId = :bookId AND chapterIndex = :chapterIndex LIMIT 1"
+  )
+  suspend fun getChapterOnce(bookId: String, chapterIndex: Int): ChapterEntity?
+
+  @Query(
     "SELECT * FROM chapter_chunks WHERE chapterId = :chapterId ORDER BY chunkIndex ASC"
   )
   suspend fun getChunksForChapterOnce(chapterId: String): List<ChapterChunkEntity>
+
+  @Query(
+    "SELECT * FROM chapter_chunks WHERE chapterId = :chapterId ORDER BY chunkIndex ASC"
+  )
+  fun observeChunksForChapter(chapterId: String): Flow<List<ChapterChunkEntity>>
 
   @Query("SELECT * FROM chapter_chunks WHERE bookId = :bookId ORDER BY chapterIndex ASC, chunkIndex ASC")
   fun observeChunksForBook(bookId: String): Flow<List<ChapterChunkEntity>>
@@ -131,6 +141,7 @@ interface AudiobookDao {
     """
     SELECT * FROM generation_tasks
     WHERE status IN ('QUEUED', 'RUNNING', 'INTERRUPTED_BY_OS')
+      AND mode = 'FULL_BOOK'
     ORDER BY queueOrder ASC, startedAtMs ASC
     """
   )
@@ -165,6 +176,7 @@ interface AudiobookDao {
         totalChunks = :totalChunks,
         updatedAtMs = :updatedAtMs,
         lastValidProgressAtMs = :lastValidProgressAtMs,
+        measuredRtf = :measuredRtf,
         errorMessage = NULL
     WHERE bookId = :bookId
     """
@@ -178,6 +190,7 @@ interface AudiobookDao {
     totalChunks: Int,
     updatedAtMs: Long,
     lastValidProgressAtMs: Long,
+    measuredRtf: Float = 0f,
   )
 
   @Query(

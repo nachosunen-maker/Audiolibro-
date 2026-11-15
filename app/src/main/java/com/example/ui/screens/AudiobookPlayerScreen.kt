@@ -48,6 +48,12 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TopAppBar
 import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.material.icons.outlined.Pause
+import androidx.compose.material.icons.outlined.Refresh
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.TextButton
 import androidx.compose.material3.minimumInteractiveComponentSize
 import androidx.compose.runtime.Composable
 import androidx.compose.runtime.LaunchedEffect
@@ -68,13 +74,19 @@ import androidx.compose.ui.unit.dp
 import androidx.core.content.ContextCompat
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
+import com.example.domain.audio.ProgressiveChapterState
 import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.Chapter
 import com.example.domain.model.NarrationEstimator
+import com.example.domain.model.ProgressiveChapterPhase
+import com.example.player.PlaybackUiState
 import com.example.ui.components.BookCover
+import com.example.ui.components.ProgressiveSegmentedBar
+import com.example.ui.components.ProgressiveStateLegend
 import com.example.ui.viewmodel.PlayerViewModel
+import kotlin.math.abs
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun AudiobookPlayerScreen(
   viewModel: PlayerViewModel,
@@ -82,6 +94,7 @@ fun AudiobookPlayerScreen(
 ) {
   val bookWithChapters by viewModel.bookWithChapters.collectAsStateWithLifecycle()
   val playbackState by viewModel.playbackState.collectAsStateWithLifecycle()
+  val progressiveState by viewModel.progressiveState.collectAsStateWithLifecycle()
   val context = LocalContext.current
 
   val notificationPermissionLauncher =
@@ -100,9 +113,11 @@ fun AudiobookPlayerScreen(
 
   val book = bookWithChapters?.book
   val playableChapters =
-    remember(bookWithChapters) {
-      bookWithChapters?.chapters?.filter {
-        it.audioStatus == AudioGenerationStatus.READY && !it.audioFilePath.isNullOrBlank()
+    remember(bookWithChapters, playbackState.currentChapterIndex) {
+      bookWithChapters?.chapters?.filter { ch ->
+        (ch.audioStatus == AudioGenerationStatus.READY && !ch.audioFilePath.isNullOrBlank()) ||
+          ch.generatedChunks > 0 ||
+          (playbackState.isProgressiveActive && ch.chapterIndex == playbackState.currentChapterIndex)
       } ?: emptyList()
     }
 
@@ -328,6 +343,43 @@ fun AudiobookPlayerScreen(
           }
 
           item {
+            val speedOptions = listOf(0.85f, 1.0f, 1.25f, 1.5f)
+            FlowRow(
+              modifier = Modifier.fillMaxWidth(),
+              horizontalArrangement = Arrangement.spacedBy(8.dp, Alignment.CenterHorizontally),
+              verticalArrangement = Arrangement.spacedBy(6.dp),
+            ) {
+              speedOptions.forEach { spd ->
+                val selected = abs(playbackState.playbackSpeed - spd) < 0.03f
+                FilterChip(
+                  selected = selected,
+                  onClick = { viewModel.setPlaybackSpeed(spd) },
+                  label = { Text("${spd}x") },
+                  modifier = Modifier.testTag("player_speed_${spd}x"),
+                )
+              }
+            }
+          }
+
+          val matchingProgressive =
+            progressiveState?.takeIf {
+              it.bookId == playbackState.activeBookId &&
+                it.chapterIndex == playbackState.currentChapterIndex
+            }
+          if (playbackState.isProgressiveActive ||
+            (matchingProgressive != null && !matchingProgressive.isCompleteChapterReady)
+          ) {
+            item {
+              ProgressiveBufferPlayerCard(
+                playbackState = playbackState,
+                progressiveState = matchingProgressive,
+                onPauseLookahead = viewModel::pauseLookaheadGeneration,
+                onResumeLookahead = viewModel::resumeLookaheadGeneration,
+              )
+            }
+          }
+
+          item {
             Spacer(modifier = Modifier.height(4.dp))
             Text(
               text = "Capítulos disponibles sin conexión (${playableChapters.size})",
@@ -414,11 +466,149 @@ private fun PlayableChapterRow(
         )
         Text(
           text =
-            "${NarrationEstimator.formatPlaybackTime(chapter.audioDurationMs)} · ${NarrationEstimator.formatFileSize(chapter.audioSizeBytes)}",
+            if (chapter.audioStatus == AudioGenerationStatus.READY) {
+              "${NarrationEstimator.formatPlaybackTime(chapter.audioDurationMs)} · ${NarrationEstimator.formatFileSize(chapter.audioSizeBytes)}"
+            } else {
+              "Carga progresiva · ${chapter.generatedChunks}/${chapter.totalChunks.coerceAtLeast(1)} fragmentos"
+            },
           style = MaterialTheme.typography.bodySmall,
           color = MaterialTheme.colorScheme.onSurfaceVariant,
         )
       }
+    }
+  }
+}
+
+@Composable
+private fun ProgressiveBufferPlayerCard(
+  playbackState: PlaybackUiState,
+  progressiveState: ProgressiveChapterState?,
+  onPauseLookahead: () -> Unit,
+  onResumeLookahead: () -> Unit,
+) {
+  val phase = progressiveState?.phase ?: ProgressiveChapterPhase.PLAYING_LOOKAHEAD
+  val preparedFraction =
+    progressiveState?.overallChapterProgressFraction
+      ?: if (playbackState.durationMs > 0L) {
+        (playbackState.bufferedDurationMs.toFloat() / playbackState.durationMs.toFloat()).coerceIn(0f, 1f)
+      } else {
+        1f
+      }
+  val playedFraction =
+    if (playbackState.bufferedDurationMs > 0L) {
+      (playbackState.positionMs.toFloat() / playbackState.bufferedDurationMs.toFloat()).coerceIn(0f, 1f) *
+        preparedFraction
+    } else {
+      0f
+    }
+
+  Surface(
+    modifier = Modifier.fillMaxWidth().testTag("player_progressive_buffer_card"),
+    shape = MaterialTheme.shapes.large,
+    color = MaterialTheme.colorScheme.surface,
+    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+  ) {
+    Column(
+      modifier = Modifier.padding(14.dp),
+      verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.SpaceBetween,
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        Column(modifier = Modifier.weight(1f)) {
+          Text(
+            text =
+              when {
+                playbackState.isWaitingForBuffer -> "Esperando siguiente fragmento local…"
+                progressiveState != null && progressiveState.isSynthesizing ->
+                  progressiveState.statusMessage.ifBlank { "Generando audio por adelantado…" }
+                phase == ProgressiveChapterPhase.PAUSED -> "Generación por adelantado en pausa"
+                phase == ProgressiveChapterPhase.RECOVERABLE_ERROR ->
+                  "Error recuperable en búfer · pulsa Reintentar"
+                else -> "Audio preparado · reproducción progresiva"
+              },
+            style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+            color =
+              if (phase == ProgressiveChapterPhase.RECOVERABLE_ERROR) {
+                MaterialTheme.colorScheme.error
+              } else {
+                MaterialTheme.colorScheme.primary
+              },
+            modifier = Modifier.testTag("player_progressive_status_text"),
+          )
+          Text(
+            text =
+              "Búfer adelantado: ${NarrationEstimator.formatPlaybackTime(playbackState.aheadBufferedDurationMs)} · Listos ${progressiveState?.chunksCompleted ?: 0}/${progressiveState?.totalChunks ?: 0}",
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+          )
+        }
+
+        if (progressiveState?.isCompleteChapterReady != true) {
+          when (phase) {
+            ProgressiveChapterPhase.PAUSED -> {
+              TextButton(
+                onClick = onResumeLookahead,
+                modifier = Modifier.testTag("player_resume_lookahead_button"),
+              ) {
+                Icon(
+                  imageVector = Icons.Rounded.PlayArrow,
+                  contentDescription = null,
+                  modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Reanudar")
+              }
+            }
+            ProgressiveChapterPhase.RECOVERABLE_ERROR -> {
+              TextButton(
+                onClick = onResumeLookahead,
+                modifier = Modifier.testTag("player_retry_lookahead_button"),
+              ) {
+                Icon(
+                  imageVector = Icons.Outlined.Refresh,
+                  contentDescription = null,
+                  modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Reintentar")
+              }
+            }
+            else -> {
+              TextButton(
+                onClick = onPauseLookahead,
+                modifier = Modifier.testTag("player_pause_lookahead_button"),
+              ) {
+                Icon(
+                  imageVector = Icons.Outlined.Pause,
+                  contentDescription = null,
+                  modifier = Modifier.size(16.dp),
+                )
+                Spacer(modifier = Modifier.width(4.dp))
+                Text("Pausar")
+              }
+            }
+          }
+        }
+      }
+
+      ProgressiveSegmentedBar(
+        playedFraction = playedFraction,
+        preparedFraction = preparedFraction,
+        isGeneratingAhead = progressiveState?.isSynthesizing == true,
+        isPaused = phase == ProgressiveChapterPhase.PAUSED,
+        isError = phase == ProgressiveChapterPhase.RECOVERABLE_ERROR,
+        totalChunks = progressiveState?.totalChunks ?: 1,
+      )
+
+      ProgressiveStateLegend(
+        phase = phase,
+        canStartPlayback = true,
+        isPlaying = playbackState.isPlaying,
+        isSynthesizing = progressiveState?.isSynthesizing == true,
+      )
     }
   }
 }

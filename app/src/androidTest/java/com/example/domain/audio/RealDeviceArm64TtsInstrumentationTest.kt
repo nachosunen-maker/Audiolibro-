@@ -114,4 +114,104 @@ class RealDeviceArm64TtsInstrumentationTest {
       engine.release()
     }
   }
+
+  @Test
+  fun arm64_benchmark_progressiveChunkTelemetry_initPhonemizeInferenceWavAndPlayback() {
+    assumeTrue(
+      "Esta prueba requiere un dispositivo Android real arm64-v8a",
+      Build.SUPPORTED_ABIS.any { it.equals("arm64-v8a", ignoreCase = true) },
+    )
+
+    val context: Context = InstrumentationRegistry.getInstrumentation().targetContext
+    val provider = PiperAudioSynthesisProvider(context)
+    val outDir = File(context.cacheDir, "arm64_benchmark_test").apply { mkdirs() }
+
+    val fragments =
+      listOf(
+        "El viento del sur doblaba los cipreses al caer la tarde.",
+        "Cuando el reloj dio las doce, nadie se atrevió a abrir la puerta de madera vieja ni a pronunciar palabra alguna en toda la estancia silenciosa.",
+        "Durante años recorrió ciudades portuarias buscando aquel libro encuadernado en tela oscura cuyo título apenas recordaba, convencido de que entre sus páginas aguardaba la única explicación posible.",
+      )
+
+    try {
+      val t0 = System.nanoTime()
+      val rtfEstimator = RtfEstimator()
+      val results = mutableListOf<SynthesisTelemetry>()
+
+      runBlocking {
+        for ((index, text) in fragments.withIndex()) {
+          val synthResult =
+            provider.synthesizeFragment(
+              text = text,
+              voice = NarratorVoice.FEMALE,
+              bookTitle = "Benchmark",
+              chapterTitle = "Cap 1",
+            )
+          assertTrue("Fallo en fragmento $index", synthResult.isSuccess)
+          val payload = synthResult.getOrThrow()
+          val telemetry = payload.telemetry
+          assertNotNull(telemetry)
+
+          val wavFile = File(outDir, "bench_part_$index.wav")
+          val writeStartNs = System.nanoTime()
+          val wavInfo =
+            WavAudioCodec.writePcmAsWav(
+              pcmBytes = payload.bytes,
+              outputFile = wavFile,
+              sampleRate = payload.sampleRate,
+              channels = payload.channels,
+              bitsPerSample = payload.bitsPerSample,
+            )
+          val wavWriteMs = ((System.nanoTime() - writeStartNs) / 1_000_000L).coerceAtLeast(0L)
+          val updatedTelemetry = telemetry!!.copy(wavWriteMs = wavWriteMs, audioDurationMs = wavInfo.durationMs)
+          results += updatedTelemetry
+          val synthMs =
+            (updatedTelemetry.phonemizationMs +
+              updatedTelemetry.inferenceMs +
+              updatedTelemetry.pcmEncodingMs +
+              wavWriteMs)
+              .coerceAtLeast(1L)
+          rtfEstimator.recordFragment(synthMs, wavInfo.durationMs)
+        }
+      }
+
+      val prepStartNs = System.nanoTime()
+      runBlocking {
+        withContext(Dispatchers.Main) {
+          val player = ExoPlayer.Builder(context).build()
+          try {
+            val items =
+              fragments.indices.map { idx ->
+                MediaItem.fromUri(File(outDir, "bench_part_$idx.wav").toURI().toString())
+              }
+            player.setMediaItems(items)
+            player.prepare()
+            assertEquals(fragments.size, player.mediaItemCount)
+          } finally {
+            player.release()
+          }
+        }
+      }
+      val playbackPrepareMs = ((System.nanoTime() - prepStartNs) / 1_000_000L).coerceAtLeast(0L)
+      val totalBenchmarkMs = ((System.nanoTime() - t0) / 1_000_000L).coerceAtLeast(0L)
+      val measuredRtf = rtfEstimator.currentRtf()
+
+      assertTrue(measuredRtf > 0f)
+      assertTrue(results.all { it.audioDurationMs > 0L && it.inferenceMs >= 0L })
+
+      android.util.Log.i(
+        "RealDeviceArm64Bench",
+        "initMs=${results.first().initializationMs}, " +
+          "phonMs=${results.sumOf { it.phonemizationMs }}, " +
+          "inferMs=${results.sumOf { it.inferenceMs }}, " +
+          "wavWriteMs=${results.sumOf { it.wavWriteMs }}, " +
+          "playbackPrepareMs=$playbackPrepareMs, " +
+          "audioMs=${results.sumOf { it.audioDurationMs }}, " +
+          "RTF=$measuredRtf, totalMs=$totalBenchmarkMs",
+      )
+    } finally {
+      outDir.deleteRecursively()
+      provider.release()
+    }
+  }
 }

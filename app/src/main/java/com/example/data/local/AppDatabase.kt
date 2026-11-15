@@ -15,7 +15,7 @@ import androidx.sqlite.db.SupportSQLiteDatabase
       ChapterChunkEntity::class,
       GenerationTaskEntity::class,
     ],
-  version = 3,
+  version = 4,
   exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -106,6 +106,19 @@ abstract class AppDatabase : RoomDatabase() {
         }
       }
 
+    val MIGRATION_3_4 =
+      object : Migration(3, 4) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+          db.execSQL(
+            "ALTER TABLE generation_tasks ADD COLUMN mode TEXT NOT NULL DEFAULT 'FULL_BOOK'"
+          )
+          db.execSQL("ALTER TABLE generation_tasks ADD COLUMN targetChapterIndex INTEGER")
+          db.execSQL(
+            "ALTER TABLE generation_tasks ADD COLUMN measuredRtf REAL NOT NULL DEFAULT 0.0"
+          )
+        }
+      }
+
     fun getInstance(context: Context): AppDatabase {
       return INSTANCE
         ?: synchronized(this) {
@@ -115,7 +128,7 @@ abstract class AppDatabase : RoomDatabase() {
                 AppDatabase::class.java,
                 "audiolibro.db",
               )
-              .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
+              .addMigrations(MIGRATION_1_2, MIGRATION_2_3, MIGRATION_3_4)
               .build()
           INSTANCE = instance
           instance

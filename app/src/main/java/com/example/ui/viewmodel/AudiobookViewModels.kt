@@ -157,8 +157,7 @@ class BookDetailViewModel(
 
   fun generateAudiobook() {
     Log.i("BookDetailVM", "generateAudiobook() invocado para bookId=$bookId")
-    repository.clearGenerationError(bookId)
-    repository.startAudiobookGeneration(bookId)
+    repository.requestAudiobookGeneration(bookId)
   }
 
   fun cancelGeneration() {

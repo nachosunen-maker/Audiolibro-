@@ -1,8 +1,12 @@
 package com.example.ui.screens
 
+import android.Manifest
+import android.content.pm.PackageManager
+import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
+import androidx.core.content.ContextCompat
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -72,6 +76,7 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.platform.testTag
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
@@ -81,6 +86,7 @@ import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
 import com.example.domain.audio.AudioSynthesisProvider
 import com.example.domain.audio.BookGenerationProgress
+import com.example.domain.audio.GenerationPhase
 import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.Book
 import com.example.domain.model.BookWithChapters
@@ -94,6 +100,7 @@ import com.example.ui.components.MiniPlayerBar
 import com.example.ui.components.formatIntegerEs
 import com.example.ui.viewmodel.BookDetailUiState
 import com.example.ui.viewmodel.BookDetailViewModel
+import kotlin.math.roundToInt
 
 @OptIn(ExperimentalMaterial3Api::class)
 @Composable
@@ -107,12 +114,33 @@ fun BookDetailScreen(
   val playbackState by viewModel.playbackState.collectAsStateWithLifecycle()
   val exportFeedback by viewModel.exportFeedback.collectAsStateWithLifecycle()
 
+  val context = LocalContext.current
   val snackbarHostState = remember { SnackbarHostState() }
   var showDeleteBookDialog by remember { mutableStateOf(false) }
   var showDeleteAudioDialog by remember { mutableStateOf(false) }
   var showLegalNoticesDialog by remember { mutableStateOf(false) }
   var chapterQuery by remember { mutableStateOf("") }
   var pendingChapterToExport by remember { mutableStateOf<Chapter?>(null) }
+
+  val notificationPermissionLauncher =
+    rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
+      // Aunque no se concedan notificaciones, el servicio local sigue ejecutando la síntesis offline.
+      viewModel.generateAudiobook()
+    }
+
+  val startGenerationWithNotificationCheck = remember(context, viewModel) {
+    {
+      val needsNotificationPermission =
+        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
+          ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
+            PackageManager.PERMISSION_GRANTED
+      if (needsNotificationPermission) {
+        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
+      } else {
+        viewModel.generateAudiobook()
+      }
+    }
+  }
 
   val createChapterWavLauncher =
     rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("audio/wav")) { uri ->
@@ -240,7 +268,7 @@ fun BookDetailScreen(
                   bookWithChapters = bookWithChapters,
                   audioProvider = viewModel.audioProvider,
                   progress = state.generationProgress,
-                  onGenerate = viewModel::generateAudiobook,
+                  onGenerate = startGenerationWithNotificationCheck,
                   onCancel = viewModel::cancelGeneration,
                   onDismissError = viewModel::clearGenerationError,
                   onOpenPlayer = { onOpenPlayer(book.id, null) },
@@ -670,7 +698,16 @@ private fun AudiobookGenerationSection(
   val readyCount = bookWithChapters.readyChaptersCount
   val totalCount = chapters.size
   val isRunning = progress?.isRunning == true
-  val hasPartialProgress = readyCount > 0 && readyCount < totalCount
+  val hasStaleGenerating =
+    !isRunning && chapters.any { it.audioStatus == AudioGenerationStatus.GENERATING }
+  val hasPartialChunks = chapters.any { it.generatedChunks > 0 }
+  val hasPartialProgress =
+    !bookWithChapters.isCompleteAudiobookReady &&
+      (readyCount > 0 || hasPartialChunks || hasStaleGenerating ||
+        progress?.phase == GenerationPhase.INTERRUPTED)
+  val persistedChapterError =
+    chapters.firstOrNull { it.audioStatus == AudioGenerationStatus.ERROR }?.generationError
+  val effectiveErrorMessage = progress?.errorMessage ?: persistedChapterError
 
   Surface(
     modifier = Modifier.fillMaxWidth(),
@@ -765,29 +802,100 @@ private fun AudiobookGenerationSection(
       }
 
       if (isRunning && progress != null) {
-        Column(verticalArrangement = Arrangement.spacedBy(6.dp)) {
-          val fraction =
-            if (totalCount > 0) {
-              (progress.completedChapters.toFloat() / totalCount.toFloat()).coerceIn(0f, 1f)
-            } else {
-              0f
+        Column(
+          modifier = Modifier.testTag("generation_progress_section"),
+          verticalArrangement = Arrangement.spacedBy(6.dp),
+        ) {
+          val fraction = progress.globalProgressFraction
+          val percent = (fraction * 100f).roundToInt().coerceIn(0, 100)
+          if (progress.phase == GenerationPhase.PREPARING && progress.totalBookChunks == 0) {
+            LinearProgressIndicator(
+              modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
+            )
+          } else {
+            LinearProgressIndicator(
+              progress = { fraction },
+              modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
+            )
+          }
+          Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.SpaceBetween,
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Text(
+              text = progress.statusMessage.ifBlank { "Generando audio…" },
+              style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+              color = MaterialTheme.colorScheme.primary,
+              modifier = Modifier.weight(1f),
+            )
+            if (progress.totalBookChunks > 0) {
+              Text(
+                text = "$percent %",
+                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
+                color = MaterialTheme.colorScheme.primary,
+              )
             }
-          LinearProgressIndicator(
-            progress = { fraction },
-            modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
-          )
+          }
           Text(
-            text = progress.statusMessage.ifBlank { "Generando audio…" },
-            style = MaterialTheme.typography.bodySmall,
-            color = MaterialTheme.colorScheme.primary,
+            text = "Continúa en segundo plano incluso con la pantalla apagada.",
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
           )
+        }
+      } else if (hasPartialProgress && effectiveErrorMessage.isNullOrBlank()) {
+        Surface(
+          modifier = Modifier.fillMaxWidth().testTag("generation_interrupted_banner"),
+          shape = MaterialTheme.shapes.medium,
+          color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.65f),
+          border = BorderStroke(1.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.35f)),
+        ) {
+          Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(4.dp),
+          ) {
+            Text(
+              text = "Generación interrumpida · pendiente de reanudación",
+              style = MaterialTheme.typography.labelLarge,
+              color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+            Text(
+              text =
+                "Los fragmentos y capítulos ya sintetizados permanecen guardados. Pulsa «Reanudar generación» para continuar sin empezar desde cero.",
+              style = MaterialTheme.typography.bodySmall,
+              color = MaterialTheme.colorScheme.onTertiaryContainer,
+            )
+          }
+        }
+      } else if (bookWithChapters.isCompleteAudiobookReady && !isRunning) {
+        Surface(
+          modifier = Modifier.fillMaxWidth().testTag("generation_completed_banner"),
+          shape = MaterialTheme.shapes.medium,
+          color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
+        ) {
+          Row(
+            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically,
+          ) {
+            Icon(
+              imageVector = Icons.Rounded.CheckCircle,
+              contentDescription = null,
+              tint = MaterialTheme.colorScheme.secondary,
+              modifier = Modifier.size(18.dp),
+            )
+            Text(
+              text = "Audiolibro completo listo (${totalCount} capítulos · WAV 22.050 Hz mono)",
+              style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
+              color = MaterialTheme.colorScheme.onSecondaryContainer,
+            )
+          }
         }
       }
 
-      val errorMessage = progress?.errorMessage
-      if (!errorMessage.isNullOrBlank()) {
+      if (!effectiveErrorMessage.isNullOrBlank() && !isRunning) {
         Surface(
-          modifier = Modifier.fillMaxWidth(),
+          modifier = Modifier.fillMaxWidth().testTag("generation_error_banner"),
           shape = MaterialTheme.shapes.medium,
           color = MaterialTheme.colorScheme.errorContainer,
         ) {
@@ -797,20 +905,22 @@ private fun AudiobookGenerationSection(
             verticalAlignment = Alignment.CenterVertically,
           ) {
             Text(
-              text = errorMessage,
+              text = effectiveErrorMessage,
               style = MaterialTheme.typography.bodySmall,
               color = MaterialTheme.colorScheme.onErrorContainer,
               modifier = Modifier.weight(1f),
             )
-            IconButton(
-              onClick = onDismissError,
-              modifier = Modifier.minimumInteractiveComponentSize(),
-            ) {
-              Icon(
-                imageVector = Icons.Rounded.Close,
-                contentDescription = "Cerrar aviso",
-                tint = MaterialTheme.colorScheme.onErrorContainer,
-              )
+            if (progress?.errorMessage != null) {
+              IconButton(
+                onClick = onDismissError,
+                modifier = Modifier.minimumInteractiveComponentSize(),
+              ) {
+                Icon(
+                  imageVector = Icons.Rounded.Close,
+                  contentDescription = "Cerrar aviso",
+                  tint = MaterialTheme.colorScheme.onErrorContainer,
+                )
+              }
             }
           }
         }

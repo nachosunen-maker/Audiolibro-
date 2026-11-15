@@ -11,7 +11,9 @@ import com.example.data.local.ChapterEntity
 import com.example.data.storage.AudiobookStorageManager
 import com.example.domain.audio.AudioSynthesisProvider
 import com.example.domain.audio.AudiobookGenerationOrchestrator
+import com.example.domain.audio.AudiobookGenerationService
 import com.example.domain.audio.BookGenerationProgress
+import com.example.domain.audio.GenerationPhase
 import com.example.domain.audio.PiperAudioSynthesisProvider
 import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.Book
@@ -65,7 +67,10 @@ class AudiobookRepository(
     }
   private val generationScope =
     CoroutineScope(SupervisorJob() + Dispatchers.IO + generationExceptionHandler)
-  private val activeJobs = mutableMapOf<String, Job>()
+  private val queueLock = Any()
+  private val pendingBookIds = ArrayDeque<String>()
+  @Volatile private var activeBookId: String? = null
+  @Volatile private var activeJob: Job? = null
 
   private val _generationProgress =
     MutableStateFlow<Map<String, BookGenerationProgress>>(emptyMap())
@@ -189,61 +194,179 @@ class AudiobookRepository(
       BookWithChapters(book = fallbackBook.toDomain(), chapters = chapters)
     }
 
-  fun startAudiobookGeneration(bookId: String) {
-    if (activeJobs[bookId]?.isActive == true) return
-    _generationProgress.update { map ->
-      map +
-        (bookId to
-          BookGenerationProgress(
-            bookId = bookId,
-            isRunning = true,
-            statusMessage = "Preparando fragmentos del libro…",
-          ))
+  /**
+   * Punto de entrada desde la interfaz gráfica: inicia el servicio en primer plano
+   * (`AudiobookGenerationService`, tipo `dataSync`) para mantener la síntesis activa en segundo plano
+   * o con la pantalla apagada. Si el sistema restringe FGS, continúa en `enqueueAudiobookGeneration`.
+   */
+  fun requestAudiobookGeneration(bookId: String) {
+    Log.i(TAG_GEN, "requestAudiobookGeneration(bookId=$bookId) -> iniciando servicio en primer plano")
+    clearGenerationError(bookId)
+    val startedService =
+      runCatching {
+          AudiobookGenerationService.startBookGeneration(context.applicationContext, bookId)
+          true
+        }
+        .onFailure { err ->
+          Log.w(
+            TAG_GEN,
+            "No se pudo iniciar AudiobookGenerationService en primer plano; ejecutando cola local directa",
+            err,
+          )
+        }
+        .getOrDefault(false)
+
+    if (!startedService) {
+      enqueueAudiobookGeneration(bookId)
     }
+  }
+
+  fun startAudiobookGeneration(bookId: String) {
+    enqueueAudiobookGeneration(bookId)
+  }
+
+  fun enqueueAudiobookGeneration(bookId: String) {
+    val shouldLaunch =
+      synchronized(queueLock) {
+        if (activeBookId == bookId && activeJob?.isActive == true) {
+          return
+        }
+        if (!pendingBookIds.contains(bookId)) {
+          pendingBookIds.addLast(bookId)
+        }
+        _generationProgress.update { map ->
+          val prev = map[bookId]
+          map +
+            (bookId to
+              BookGenerationProgress(
+                bookId = bookId,
+                bookTitle = prev?.bookTitle.orEmpty(),
+                isRunning = true,
+                phase = GenerationPhase.PREPARING,
+                totalChapters = prev?.totalChapters ?: 0,
+                completedChapters = prev?.completedChapters ?: 0,
+                completedBookChunks = prev?.completedBookChunks ?: 0,
+                totalBookChunks = prev?.totalBookChunks ?: 0,
+                statusMessage = "Preparando los capítulos del libro…",
+              ))
+        }
+        activeJob?.isActive != true
+      }
+
+    if (shouldLaunch) {
+      launchNextQueuedJob()
+    }
+  }
+
+  fun hasActiveOrQueuedGenerations(): Boolean =
+    synchronized(queueLock) { activeJob?.isActive == true || pendingBookIds.isNotEmpty() }
+
+  private fun launchNextQueuedJob() {
+    val nextBookId =
+      synchronized(queueLock) {
+        if (activeJob?.isActive == true) return
+        val id = pendingBookIds.removeFirstOrNull()
+        activeBookId = id
+        id
+      } ?: return
 
     val job =
       generationScope.launch {
         try {
           val result =
-            orchestrator.generateBookAudiobook(bookId) { progress ->
-              _generationProgress.update { map -> map + (bookId to progress) }
+            orchestrator.generateBookAudiobook(nextBookId) { progress ->
+              _generationProgress.update { map -> map + (nextBookId to progress) }
             }
           result.onFailure { err ->
-            Log.e(TAG_GEN, "Fallo en generación de audiolibro (bookId=$bookId): ${err.javaClass.simpleName} - ${err.message}", err)
+            Log.e(
+              TAG_GEN,
+              "Fallo en generación de audiolibro (bookId=$nextBookId): ${err.javaClass.simpleName} - ${err.message}",
+              err,
+            )
             _generationProgress.update { map ->
-              val current = map[bookId] ?: BookGenerationProgress(bookId = bookId, isRunning = false)
+              val current =
+                map[nextBookId]
+                  ?: BookGenerationProgress(
+                    bookId = nextBookId,
+                    isRunning = false,
+                    phase = GenerationPhase.ERROR,
+                  )
               map +
-                (bookId to
+                (nextBookId to
                   current.copy(
                     isRunning = false,
+                    phase = GenerationPhase.ERROR,
                     errorMessage = err.localizedMessage ?: "No se pudo completar la generación.",
                   ))
             }
           }
         } catch (e: CancellationException) {
-          Log.i(TAG_GEN, "Generación cancelada para bookId=$bookId")
+          Log.i(TAG_GEN, "Generación interrumpida/pausada para bookId=$nextBookId")
+          _generationProgress.update { map ->
+            val current = map[nextBookId]
+            if (current != null) {
+              map +
+                (nextBookId to
+                  current.copy(
+                    isRunning = false,
+                    phase = GenerationPhase.INTERRUPTED,
+                    statusMessage = "Generación interrumpida. El progreso guardado se conserva.",
+                  ))
+            } else {
+              map
+            }
+          }
           throw e
         } catch (t: Throwable) {
-          Log.e(TAG_GEN, "Excepción no controlada en generación de audiolibro (bookId=$bookId): ${t.javaClass.simpleName} - ${t.message}", t)
+          Log.e(
+            TAG_GEN,
+            "Excepción no controlada en generación de audiolibro (bookId=$nextBookId): ${t.javaClass.simpleName} - ${t.message}",
+            t,
+          )
           _generationProgress.update { map ->
-            val current = map[bookId] ?: BookGenerationProgress(bookId = bookId, isRunning = false)
+            val current =
+              map[nextBookId]
+                ?: BookGenerationProgress(
+                  bookId = nextBookId,
+                  isRunning = false,
+                  phase = GenerationPhase.ERROR,
+                )
             map +
-              (bookId to
+              (nextBookId to
                 current.copy(
                   isRunning = false,
-                  errorMessage = t.localizedMessage ?: "Ocurrió un error inesperado durante la generación.",
+                  phase = GenerationPhase.ERROR,
+                  errorMessage =
+                    t.localizedMessage ?: "Ocurrió un error inesperado durante la generación.",
                 ))
           }
         } finally {
-          activeJobs.remove(bookId)
+          val hasMore =
+            synchronized(queueLock) {
+              if (activeBookId == nextBookId) {
+                activeBookId = null
+                activeJob = null
+              }
+              pendingBookIds.isNotEmpty()
+            }
+          if (hasMore) {
+            launchNextQueuedJob()
+          }
         }
       }
-    activeJobs[bookId] = job
+
+    synchronized(queueLock) {
+      activeJob = job
+    }
   }
 
   fun cancelAudiobookGeneration(bookId: String) {
-    activeJobs[bookId]?.cancel()
-    activeJobs.remove(bookId)
+    val jobToCancel =
+      synchronized(queueLock) {
+        pendingBookIds.remove(bookId)
+        if (activeBookId == bookId) activeJob else null
+      }
+    jobToCancel?.cancel()
     _generationProgress.update { map ->
       val current = map[bookId]
       if (current != null) {
@@ -251,6 +374,7 @@ class AudiobookRepository(
           (bookId to
             current.copy(
               isRunning = false,
+              phase = GenerationPhase.INTERRUPTED,
               statusMessage = "Generación pausada. El progreso guardado se conserva.",
             ))
       } else {
@@ -259,10 +383,46 @@ class AudiobookRepository(
     }
   }
 
+  fun cancelAllGenerations() {
+    val active =
+      synchronized(queueLock) {
+        val ids = pendingBookIds.toList()
+        pendingBookIds.clear()
+        val runningId = activeBookId
+        Pair(ids + listOfNotNull(runningId), activeJob)
+      }
+    active.second?.cancel()
+    _generationProgress.update { map ->
+      var updated = map
+      for (id in active.first) {
+        val cur = updated[id]
+        if (cur != null) {
+          updated =
+            updated +
+              (id to
+                cur.copy(
+                  isRunning = false,
+                  phase = GenerationPhase.INTERRUPTED,
+                  statusMessage = "Generación pausada. El progreso guardado se conserva.",
+                ))
+        }
+      }
+      updated
+    }
+  }
+
   fun clearGenerationError(bookId: String) {
     _generationProgress.update { map ->
       val current = map[bookId] ?: return@update map
-      map + (bookId to current.copy(errorMessage = null))
+      map +
+        (bookId to
+          current.copy(
+            phase =
+              if (current.isRunning) current.phase
+              else if (current.completedBookChunks > 0) GenerationPhase.INTERRUPTED
+              else GenerationPhase.IDLE,
+            errorMessage = null,
+          ))
     }
   }
 

@@ -348,10 +348,10 @@ fun LegalNoticesDialog(onDismiss: () -> Unit) {
             "Basado en el corpus SHARVARD de español peninsular (University of Edinburgh DataShare · DOI: 10.3109/14992027.2014.907507), atribuido a Vincent Aubanel, María Luisa García Lecumberri y Martin Cooke.",
         )
         LegalLicenseBlock(
-          title = "eSpeak NG (espeak-ng-data)",
+          title = "eSpeak NG (espeak-ng-data) y piper-phonemize v1.5.9",
           license = "GNU General Public License v3.0+ (GPLv3+)",
           body =
-            "Datos fonéticos y conversión texto-a-fonemas en español proporcionados por eSpeak NG bajo licencia GPLv3 o posterior.",
+            "Conversión fonética nativa español-IPA sin conexión mediante eSpeak NG y csukuangfj/piper-phonemize (JNI arm64-v8a) bajo licencia GPLv3.",
         )
       }
     },

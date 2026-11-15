@@ -38,4 +38,13 @@ Las narraciones generadas por **Audiolibro** se producen de forma sintética en 
 
 - **Proyecto:** https://github.com/espeak-ng/espeak-ng
 - **Licencia:** GNU General Public License v3.0 or later (`GPLv3+`)
-- **Uso en esta app:** Datos fonéticos y conversión texto-a-fonemas para español (`es`) utilizados por `sherpa-onnx` durante la inferencia Piper VITS offline.
+- **Uso en esta app:** Datos fonéticos y conversión texto-a-fonemas para español (`es`) ejecutados de forma nativa sin conexión durante la síntesis Piper VITS.
+
+---
+
+## 6. piper-phonemize (`com.github.csukuangfj.piper-phonemize:piper-phonemize` v1.5.9)
+
+- **Proyecto:** https://github.com/csukuangfj/piper-phonemize
+- **Licencia:** GNU General Public License v3.0 (`GPLv3`)
+- **Uso en esta app:** Puente nativo JNI (`arm64-v8a`) que enlaza eSpeak NG con Java/Kotlin en Android para producir los codepoints IPA reales suministrados a `sherpa-onnx` (`GenerationConfig.phonemeCodepoints`).
+

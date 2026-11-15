@@ -97,6 +97,7 @@ dependencies {
   implementation(libs.androidx.media3.exoplayer)
   implementation(libs.androidx.media3.session)
   implementation(files("libs/sherpa-onnx-2.0.1.aar"))
+  implementation(files("libs/piper-phonemize-v1.5.9.aar"))
   implementation(libs.kotlinx.coroutines.android)
   implementation(libs.kotlinx.coroutines.core)
   // implementation(libs.logging.interceptor)

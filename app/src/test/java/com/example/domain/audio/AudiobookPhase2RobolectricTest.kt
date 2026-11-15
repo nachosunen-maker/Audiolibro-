@@ -819,6 +819,196 @@ class AudiobookPhase2RobolectricTest {
       controller.releaseForTesting()
       testPlayer.release()
     }
+
+  @Test
+  fun `AudiobookGenerationService declares dataSync permission creates channel and handles start cancel safely`() {
+    val pkgInfo =
+      context.packageManager.getPackageInfo(
+        context.packageName,
+        android.content.pm.PackageManager.GET_PERMISSIONS or
+          android.content.pm.PackageManager.GET_SERVICES,
+      )
+    val permissions = pkgInfo.requestedPermissions?.toSet().orEmpty()
+    assertTrue(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_DATA_SYNC))
+    val serviceInfo =
+      pkgInfo.services?.firstOrNull {
+        it.name == AudiobookGenerationService::class.java.name
+      }
+    assertNotNull(serviceInfo)
+
+    val dao = db.audiobookDao()
+    val repo = AudiobookRepository(context, dao, storageManager = storageManager)
+    val controller = Robolectric.buildService(AudiobookGenerationService::class.java)
+    val service = controller.create().get()
+    service.repositoryOverride = repo
+
+    val cancelIntent =
+      android.content.Intent(context, AudiobookGenerationService::class.java).apply {
+        action = AudiobookGenerationService.ACTION_CANCEL_GENERATION
+        putExtra(AudiobookGenerationService.EXTRA_BOOK_ID, "book-1")
+      }
+    service.onStartCommand(cancelIntent, 0, 1)
+
+    val nm =
+      context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
+    assertNotNull(nm.getNotificationChannel(AudiobookGenerationService.CHANNEL_ID_GENERATION))
+    controller.destroy()
+  }
+
+  @Test
+  fun `orchestrator prepares all chapters upfront and BookDetailScreen displays interrupted resume banner`() =
+    runTest {
+      val dao = db.audiobookDao()
+      dao.insertBookWithChapters(
+        BookEntity(
+          id = "book-prep",
+          title = "Obra Preparada",
+          author = "Autora",
+          language = "es",
+          publisher = "",
+          description = "",
+          coverImagePath = null,
+          sourceFileName = "prep.epub",
+          selectedVoice = NarratorVoice.FEMALE.name,
+          totalChapters = 2,
+          totalWords = 20,
+          totalCharacters = 120,
+          estimatedMinutes = 1,
+          importedAt = 100L,
+        ),
+        listOf(
+          ChapterEntity(
+            id = "book-prep_ch_1",
+            bookId = "book-prep",
+            chapterIndex = 1,
+            title = "Cap 1",
+            contentText = "Primer capítulo listo para sintetizar.",
+            wordCount = 5,
+            characterCount = 39,
+            estimatedMinutes = 1,
+            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
+            audioFilePath = null,
+          ),
+          ChapterEntity(
+            id = "book-prep_ch_2",
+            bookId = "book-prep",
+            chapterIndex = 2,
+            title = "Cap 2",
+            contentText = "Segundo capítulo preparado desde el principio.",
+            wordCount = 6,
+            characterCount = 46,
+            estimatedMinutes = 1,
+            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
+            audioFilePath = null,
+          ),
+        ),
+      )
+
+      var allChaptersPreparedBeforeFirstSynth = false
+      val checkingProvider =
+        object : AudioSynthesisProvider {
+          override val isConfigured = true
+          override val providerName = "Test"
+          override val modelId = "es_ES-sharvard-medium"
+
+          override suspend fun synthesizeFragment(
+            text: String,
+            voice: NarratorVoice,
+            bookTitle: String,
+            chapterTitle: String,
+          ): Result<SynthesizedAudioPayload> {
+            val chs = dao.getChaptersOnce("book-prep")
+            allChaptersPreparedBeforeFirstSynth = chs.all { it.totalChunks > 0 }
+            return Result.success(
+              SynthesizedAudioPayload(
+                bytes = ByteArray(4410) { 1 },
+                mimeType = "audio/L16;rate=22050;channels=1",
+                sampleRate = 22_050,
+              )
+            )
+          }
+        }
+
+      val observedProgress = mutableListOf<BookGenerationProgress>()
+      val orchestrator = AudiobookGenerationOrchestrator(dao, storageManager, checkingProvider)
+      val res =
+        orchestrator.generateBookAudiobook("book-prep") { prog ->
+          observedProgress += prog
+        }
+      assertTrue(res.isSuccess)
+      assertTrue(allChaptersPreparedBeforeFirstSynth)
+      assertEquals(GenerationPhase.COMPLETED, observedProgress.last().phase)
+      assertEquals(1f, observedProgress.last().globalProgressFraction, 0.001f)
+
+      // Simulate OS interruption on another book (chapter left in GENERATING with 0 ready chapters)
+      dao.insertBookWithChapters(
+        BookEntity(
+          id = "book-interrupted",
+          title = "Libro Interrumpido",
+          author = "Autor",
+          language = "es",
+          publisher = "",
+          description = "",
+          coverImagePath = null,
+          sourceFileName = "int.epub",
+          selectedVoice = NarratorVoice.MALE.name,
+          totalChapters = 1,
+          totalWords = 10,
+          totalCharacters = 60,
+          estimatedMinutes = 1,
+          importedAt = 200L,
+        ),
+        listOf(
+          ChapterEntity(
+            id = "book-interrupted_ch_1",
+            bookId = "book-interrupted",
+            chapterIndex = 1,
+            title = "Cap 1",
+            contentText = "Texto de prueba.",
+            wordCount = 3,
+            characterCount = 16,
+            estimatedMinutes = 1,
+            audioStatus = AudioGenerationStatus.GENERATING.name,
+            audioFilePath = null,
+            generatedChunks = 1,
+            totalChunks = 3,
+          )
+        ),
+      )
+
+      val repo = AudiobookRepository(context, dao, storageManager = storageManager)
+      val testPlayer = InMemoryPlaylistPlayer()
+      val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
+      val vm = BookDetailViewModel("book-interrupted", repo, controller)
+
+      composeRule.setContent {
+        AudiolibroTheme {
+          BookDetailScreen(
+            viewModel = vm,
+            onNavigateBack = {},
+            onOpenChapterText = { _, _ -> },
+            onOpenPlayer = { _, _ -> },
+          )
+        }
+      }
+
+      composeRule.waitUntil(timeoutMillis = 5_000L) {
+        composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
+      }
+      composeRule
+        .onNode(hasScrollToNodeAction())
+        .performScrollToNode(hasTestTag("generation_interrupted_banner"))
+      composeRule.onNodeWithTag("generation_interrupted_banner").assertIsDisplayed()
+      composeRule
+        .onNode(hasScrollToNodeAction())
+        .performScrollToNode(hasTestTag("generate_audiobook_button"))
+      composeRule.onNodeWithText("Reanudar generación").assertIsDisplayed()
+
+      controller.releaseForTesting()
+      testPlayer.release()
+      storageManager.deleteBookAudioFiles("book-prep")
+      storageManager.deleteBookAudioFiles("book-interrupted")
+    }
 }
 
 

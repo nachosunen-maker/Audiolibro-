@@ -19,14 +19,18 @@ import org.gradle.api.tasks.TaskAction
 abstract class PreparePiperTtsAssetsTask : DefaultTask() {
   @get:Input abstract val aarUrl: Property<String>
   @get:Input abstract val aarSha256: Property<String>
+  @get:Input abstract val phonemizerAarUrl: Property<String>
+  @get:Input abstract val phonemizerAarSha256: Property<String>
   @get:Input abstract val modelArchiveUrl: Property<String>
   @get:Input abstract val modelArchiveSha256: Property<String>
   @get:OutputFile abstract val aarOutputFile: RegularFileProperty
+  @get:OutputFile abstract val phonemizerAarOutputFile: RegularFileProperty
   @get:OutputDirectory abstract val modelOutputDir: DirectoryProperty
 
   @TaskAction
   fun prepare() {
     val aarFile = aarOutputFile.get().asFile
+    val phonemizerAarFile = phonemizerAarOutputFile.get().asFile
     val modelDir = modelOutputDir.get().asFile
     val client =
       HttpClient.newBuilder()
@@ -61,6 +65,7 @@ abstract class PreparePiperTtsAssetsTask : DefaultTask() {
     }
 
     downloadIfNeeded(aarUrl.get(), aarSha256.get(), aarFile)
+    downloadIfNeeded(phonemizerAarUrl.get(), phonemizerAarSha256.get(), phonemizerAarFile)
 
     val markerModel = File(modelDir, "es_ES-sharvard-medium.onnx")
     val markerConfig = File(modelDir, "es_ES-sharvard-medium.onnx.json")
@@ -114,11 +119,16 @@ val preparePiperTtsAssets =
       "https://github.com/k2-fsa/sherpa-onnx/releases/download/v2.0.1/sherpa-onnx-2.0.1.aar"
     )
     aarSha256.set("a8d09d1d32f3eb8520482c6d3d43fae674681c5b050385967c70a3c2c9bf0ee7")
+    phonemizerAarUrl.set(
+      "https://jitpack.io/com/github/csukuangfj/piper-phonemize/piper-phonemize/v1.5.9/piper-phonemize-v1.5.9.aar"
+    )
+    phonemizerAarSha256.set("d0ed1cc8ac8029937a10099539ff4e532e4ec875a4745137283b618d9075daa2")
     modelArchiveUrl.set(
       "https://github.com/k2-fsa/sherpa-onnx/releases/download/tts-models/vits-piper-es_ES-sharvard-medium.tar.bz2"
     )
     modelArchiveSha256.set("b30a7a83df0518f0ee1c7039506648cade99f1f9b498fc49ed2ced2e2536bb5a")
     aarOutputFile.set(layout.projectDirectory.file("libs/sherpa-onnx-2.0.1.aar"))
+    phonemizerAarOutputFile.set(layout.projectDirectory.file("libs/piper-phonemize-v1.5.9.aar"))
     modelOutputDir.set(
       layout.projectDirectory.dir("src/main/assets/tts/vits-piper-es_ES-sharvard-medium")
     )

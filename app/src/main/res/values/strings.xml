@@ -24,4 +24,5 @@
     <string name="action_prev_chapter">Anterior</string>
     <string name="action_next_chapter">Siguiente</string>
     <string name="notification_channel_playback">Reproducción de audiolibros</string>
+    <string name="notification_channel_generation">Generación de audiolibros</string>
 </resources>

@@ -81,62 +81,38 @@ class PiperAudioSynthesisProviderTest {
   }
 
   @Test
-  fun `SpanishG2PPhonemizer verbalizes Spanish numbers into natural spoken words`() {
-    assertEquals("cero", SpanishG2PPhonemizer.spellSpanishNumber(0))
-    assertEquals("uno", SpanishG2PPhonemizer.spellSpanishNumber(1))
-    assertEquals("quince", SpanishG2PPhonemizer.spellSpanishNumber(15))
-    assertEquals("veintitrés", SpanishG2PPhonemizer.spellSpanishNumber(23).replace("veintitres", "veintitrés"))
-    assertEquals("cien", SpanishG2PPhonemizer.spellSpanishNumber(100))
-    assertEquals("ciento cinco", SpanishG2PPhonemizer.spellSpanishNumber(105))
-    assertEquals("mil ochocientos noventa y ocho", SpanishG2PPhonemizer.spellSpanishNumber(1898))
+  fun `PhonemeSentenceBatcher splits oversized sentences at word spaces without injecting bos or eos markers`() {
+    val normalSentence = "hola".map { it.code }.toIntArray()
+    val oversized =
+      IntArray(900) { idx ->
+        if (idx % 120 == 119) ' '.code else 'a'.code
+      }
 
-    val verbalized = SpanishG2PPhonemizer.verbalizeNumbers("Capítulo 1: año 1898.")
-    assertTrue(verbalized.contains("uno"))
-    assertTrue(verbalized.contains("mil ochocientos noventa y ocho"))
+    val sanitized = PhonemeSentenceBatcher.sanitizeCodepoints(listOf(IntArray(0), normalSentence, oversized))
+    assertTrue(sanitized.size >= 4)
+    assertTrue(sanitized.all { it.isNotEmpty() && it.size <= SpanishPhonemizer.MAX_CODEPOINTS_PER_SENTENCE })
+    // Verificar que no se insertan delimitadores manuales '^' (94) ni '$' (36);
+    // sherpa-onnx C++ añade BOS/pad/EOS internamente en PiperPhonemesToIdsVits.
+    assertTrue(sanitized.none { arr -> arr.contains('^'.code) || arr.contains('$'.code) })
+    assertEquals(normalSentence.toList(), sanitized.first().toList())
   }
 
   @Test
-  fun `SpanishG2PPhonemizer converts Spanish literature sentences into valid SHARVARD tokens`() {
-    val tokensText =
-      context.assets
-        .open("${SherpaOnnxLocalTtsEngine.ASSET_MODEL_DIR}/${SherpaOnnxLocalTtsEngine.TOKENS_FILENAME}")
-        .bufferedReader()
-        .use { it.readText() }
-    val validTokens =
-      tokensText.lineSequence()
-        .map { it.trim() }
-        .filter { it.isNotEmpty() }
-        .mapNotNull { line ->
-          val lastSpace = line.lastIndexOf(' ')
-          if (lastSpace > 0) line.substring(0, lastSpace) else null
-        }
-        .toMutableSet()
-    validTokens.add(" ")
-
-    val sentences =
-      listOf(
-        "Capítulo 1: En un lugar de la Mancha.",
-        "El hidalgo don Quijote de la Mancha cabalgaba bajo el sol de España.",
-        "¿Quién llama a estas horas? —preguntó la bella doncella.",
-        "¡Por todos los santos! Los gigantes resultaron ser molinos de viento.",
-        "El perro de San Roque no tiene rabo porque Ramón Ramírez se lo ha cortado.",
-        "El pingüino bilingüe comía guisantes con queso y jamón.",
-        "Año nuevo, vida nueva; la verdad siempre resplandece.",
-      )
-
-    for (sentence in sentences) {
-      val tokens = SpanishG2PPhonemizer.phonemizeToTokens(sentence)
-      assertTrue("Tokens no deben estar vacíos para: $sentence", tokens.isNotEmpty())
-      assertEquals("^", tokens.first())
-      assertEquals("$", tokens.last())
-
-      val invalid = tokens.filter { it !in validTokens }
-      assertTrue("Tokens inválidos encontrados para '$sentence': $invalid", invalid.isEmpty())
-
-      val codepoints = SpanishG2PPhonemizer.tokensToCodepoints(tokens)
-      assertEquals(tokens.size, codepoints.size)
-      assertTrue(codepoints.all { it > 0 })
-    }
+  fun `bundled tokens txt matches single-codepoint Piper layout required by sherpa-onnx 2_0_1`() {
+    val tokensFile = File(SherpaOnnxLocalTtsEngine.ensureModelAssetsCopied(context), SherpaOnnxLocalTtsEngine.TOKENS_FILENAME)
+    val tokenMap = SherpaOnnxLocalTtsEngine.parseTokensFile(tokensFile)
+    assertTrue(tokenMap.size >= 150)
+    assertEquals(0, tokenMap["_"])
+    assertEquals(1, tokenMap["^"])
+    assertEquals(2, tokenMap["$"])
+    assertEquals(3, tokenMap[" "])
+    assertTrue(tokenMap.containsKey("θ"))
+    assertTrue(tokenMap.containsKey("ɲ"))
+    assertTrue(tokenMap.containsKey("ʝ"))
+    assertTrue(tokenMap.containsKey("ɾ"))
+    assertTrue(tokenMap.containsKey("β"))
+    assertTrue(tokenMap.containsKey("ð"))
+    assertTrue(tokenMap.containsKey("ɣ"))
   }
 
   @Test

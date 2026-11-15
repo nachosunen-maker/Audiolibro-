@@ -8,8 +8,14 @@ import androidx.room.migration.Migration
 import androidx.sqlite.db.SupportSQLiteDatabase
 
 @Database(
-  entities = [BookEntity::class, ChapterEntity::class, ChapterChunkEntity::class],
-  version = 2,
+  entities =
+    [
+      BookEntity::class,
+      ChapterEntity::class,
+      ChapterChunkEntity::class,
+      GenerationTaskEntity::class,
+    ],
+  version = 3,
   exportSchema = false,
 )
 abstract class AppDatabase : RoomDatabase() {
@@ -67,6 +73,39 @@ abstract class AppDatabase : RoomDatabase() {
         }
       }
 
+    val MIGRATION_2_3 =
+      object : Migration(2, 3) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+          db.execSQL(
+            """
+            CREATE TABLE IF NOT EXISTS `generation_tasks` (
+              `bookId` TEXT NOT NULL,
+              `queueOrder` INTEGER NOT NULL,
+              `voiceName` TEXT NOT NULL,
+              `status` TEXT NOT NULL,
+              `currentChapterIndex` INTEGER NOT NULL,
+              `currentChunkIndex` INTEGER NOT NULL,
+              `completedChunks` INTEGER NOT NULL,
+              `totalChunks` INTEGER NOT NULL,
+              `startedAtMs` INTEGER NOT NULL,
+              `updatedAtMs` INTEGER NOT NULL,
+              `lastValidProgressAtMs` INTEGER NOT NULL,
+              `errorMessage` TEXT,
+              PRIMARY KEY(`bookId`),
+              FOREIGN KEY(`bookId`) REFERENCES `books`(`id`) ON UPDATE NO ACTION ON DELETE CASCADE
+            )
+            """
+              .trimIndent()
+          )
+          db.execSQL(
+            "CREATE INDEX IF NOT EXISTS `index_generation_tasks_status` ON `generation_tasks` (`status`)"
+          )
+          db.execSQL(
+            "CREATE INDEX IF NOT EXISTS `index_generation_tasks_queueOrder` ON `generation_tasks` (`queueOrder`)"
+          )
+        }
+      }
+
     fun getInstance(context: Context): AppDatabase {
       return INSTANCE
         ?: synchronized(this) {
@@ -76,7 +115,7 @@ abstract class AppDatabase : RoomDatabase() {
                 AppDatabase::class.java,
                 "audiolibro.db",
               )
-              .addMigrations(MIGRATION_1_2)
+              .addMigrations(MIGRATION_1_2, MIGRATION_2_3)
               .build()
           INSTANCE = instance
           instance

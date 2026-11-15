@@ -7,6 +7,7 @@ import com.example.data.local.ChapterEntity
 import com.example.data.storage.AudiobookStorageManager
 import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.ChapterChunkStatus
+import com.example.domain.model.GenerationTaskStatus
 import com.example.domain.model.NarratorVoice
 import java.io.File
 import kotlinx.coroutines.CancellationException
@@ -61,17 +62,49 @@ class AudiobookGenerationOrchestrator(
     bookId: String,
     onProgress: (BookGenerationProgress) -> Unit = {},
   ): Result<Unit> {
+    var activeVoiceName = NarratorVoice.FEMALE.name
+    var currentChapterIdx = 0
+    var currentChunkIdx = 0
+    var totalBookChunks = 0
+    var completedBookChunks = 0
+
     return try {
       Log.i(TAG, "[Inicio] Solicitando generación continua para bookId=$bookId")
       val book =
         dao.getBookOnce(bookId)
           ?: return Result.failure(IllegalStateException("No se encontró el libro en la biblioteca."))
       val voice = NarratorVoice.fromNameOrDefault(book.selectedVoice)
+      activeVoiceName = voice.name
       val chapters = dao.getChaptersOnce(bookId).sortedBy { it.chapterIndex }
 
       if (chapters.isEmpty()) {
+        dao.updateGenerationTaskStatus(
+          bookId = bookId,
+          status = GenerationTaskStatus.ERROR.name,
+          updatedAtMs = System.currentTimeMillis(),
+          errorMessage = "Este libro no contiene capítulos para narrar.",
+        )
         return Result.failure(IllegalStateException("Este libro no contiene capítulos para narrar."))
       }
+
+      val nowStart = System.currentTimeMillis()
+      val existingTask = dao.getGenerationTaskOnce(bookId)
+      dao.upsertGenerationTask(
+        com.example.data.local.GenerationTaskEntity(
+          bookId = bookId,
+          queueOrder = existingTask?.queueOrder ?: nowStart,
+          voiceName = voice.name,
+          status = GenerationTaskStatus.RUNNING.name,
+          currentChapterIndex = existingTask?.currentChapterIndex ?: chapters.first().chapterIndex,
+          currentChunkIndex = existingTask?.currentChunkIndex ?: 0,
+          completedChunks = existingTask?.completedChunks ?: 0,
+          totalChunks = existingTask?.totalChunks ?: 0,
+          startedAtMs = existingTask?.startedAtMs ?: nowStart,
+          updatedAtMs = nowStart,
+          lastValidProgressAtMs = existingTask?.lastValidProgressAtMs ?: 0L,
+          errorMessage = null,
+        )
+      )
 
       onProgress(
         BookGenerationProgress(
@@ -88,8 +121,6 @@ class AudiobookGenerationOrchestrator(
       // para conocer el total real de fragmentos y permitir reanudación exacta ante cierres del sistema.
       val preparedChunksByChapterId = LinkedHashMap<String, List<ChapterChunkEntity>>(chapters.size)
       val chapterValidStatus = HashMap<String, Boolean>(chapters.size)
-      var totalBookChunks = 0
-      var completedBookChunks = 0
       var completedChapters = 0
       var hadStaleOrPartialWork = false
 
@@ -147,6 +178,18 @@ class AudiobookGenerationOrchestrator(
         }
       }
 
+      val prepTime = System.currentTimeMillis()
+      dao.updateGenerationTaskProgress(
+        bookId = bookId,
+        status = GenerationTaskStatus.RUNNING.name,
+        currentChapterIndex = chapters.first().chapterIndex,
+        currentChunkIndex = 0,
+        completedChunks = completedBookChunks,
+        totalChunks = totalBookChunks,
+        updatedAtMs = prepTime,
+        lastValidProgressAtMs = existingTask?.lastValidProgressAtMs ?: prepTime,
+      )
+
       Log.i(
         TAG,
         "Preparación completa para '${book.title}': ${chapters.size} capítulos, " +
@@ -176,11 +219,11 @@ class AudiobookGenerationOrchestrator(
           continue
         }
 
+        currentChapterIdx = chapter.chapterIndex
         val chapterNumber = positionIndex + 1
         val chunks = preparedChunksByChapterId[chapter.id].orEmpty()
         val totalChunks = chunks.size
         if (totalChunks == 0) {
-          // Capítulo sin texto narrable (p.ej. página vacía): marcar listo sin romper la secuencia.
           completedChapters += 1
           continue
         }
@@ -208,6 +251,7 @@ class AudiobookGenerationOrchestrator(
         try {
           for (chunk in chunks) {
             currentCoroutineContext().ensureActive()
+            currentChunkIdx = chunk.chunkIndex
 
             val targetFile = storage.chunkWavFile(bookId, chapter.chapterIndex, chunk.chunkIndex)
             val alreadySaved =
@@ -234,6 +278,12 @@ class AudiobookGenerationOrchestrator(
                 generatedChunks = doneCount,
                 totalChunks = totalChunks,
                 generationError = msg,
+              )
+              dao.updateGenerationTaskStatus(
+                bookId = bookId,
+                status = GenerationTaskStatus.ERROR.name,
+                updatedAtMs = System.currentTimeMillis(),
+                errorMessage = msg,
               )
               onProgress(
                 BookGenerationProgress(
@@ -308,6 +358,12 @@ class AudiobookGenerationOrchestrator(
                   totalChunks = totalChunks,
                   generationError = msg,
                 )
+                dao.updateGenerationTaskStatus(
+                  bookId = bookId,
+                  status = GenerationTaskStatus.ERROR.name,
+                  updatedAtMs = System.currentTimeMillis(),
+                  errorMessage = msg,
+                )
                 onProgress(
                   BookGenerationProgress(
                     bookId = bookId,
@@ -373,6 +429,18 @@ class AudiobookGenerationOrchestrator(
               generationError = null,
             )
 
+            val chunkNow = System.currentTimeMillis()
+            dao.updateGenerationTaskProgress(
+              bookId = bookId,
+              status = GenerationTaskStatus.RUNNING.name,
+              currentChapterIndex = chapter.chapterIndex,
+              currentChunkIndex = chunk.chunkIndex + 1,
+              completedChunks = completedBookChunks,
+              totalChunks = totalBookChunks,
+              updatedAtMs = chunkNow,
+              lastValidProgressAtMs = chunkNow,
+            )
+
             onProgress(
               BookGenerationProgress(
                 bookId = bookId,
@@ -426,6 +494,19 @@ class AudiobookGenerationOrchestrator(
             totalChunks = totalChunks,
             generationError = null,
           )
+          val latestTask = dao.getGenerationTaskOnce(bookId)
+          if (latestTask != null && latestTask.parsedStatus() != GenerationTaskStatus.PAUSED_BY_USER) {
+            dao.updateGenerationTaskProgress(
+              bookId = bookId,
+              status = GenerationTaskStatus.INTERRUPTED_BY_OS.name,
+              currentChapterIndex = currentChapterIdx,
+              currentChunkIndex = currentChunkIdx,
+              completedChunks = completedBookChunks,
+              totalChunks = totalBookChunks,
+              updatedAtMs = System.currentTimeMillis(),
+              lastValidProgressAtMs = latestTask.lastValidProgressAtMs,
+            )
+          }
           throw e
         } catch (e: Exception) {
           val msg = e.localizedMessage ?: "Error al guardar el archivo WAV del capítulo."
@@ -439,6 +520,12 @@ class AudiobookGenerationOrchestrator(
             generatedChunks = doneCount,
             totalChunks = totalChunks,
             generationError = msg,
+          )
+          dao.updateGenerationTaskStatus(
+            bookId = bookId,
+            status = GenerationTaskStatus.ERROR.name,
+            updatedAtMs = System.currentTimeMillis(),
+            errorMessage = msg,
           )
           onProgress(
             BookGenerationProgress(
@@ -458,6 +545,18 @@ class AudiobookGenerationOrchestrator(
           return Result.failure(e)
         }
       }
+
+      val doneNow = System.currentTimeMillis()
+      dao.updateGenerationTaskProgress(
+        bookId = bookId,
+        status = GenerationTaskStatus.COMPLETED.name,
+        currentChapterIndex = chapters.last().chapterIndex,
+        currentChunkIndex = 0,
+        completedChunks = totalBookChunks,
+        totalChunks = totalBookChunks,
+        updatedAtMs = doneNow,
+        lastValidProgressAtMs = doneNow,
+      )
 
       Log.i(TAG, "Audiolibro '${book.title}' completado al 100 % ($completedChapters/${chapters.size} capítulos)")
       onProgress(
@@ -484,6 +583,14 @@ class AudiobookGenerationOrchestrator(
         "Error general en orquestador para bookId=$bookId: ${t.javaClass.simpleName} - ${t.message}",
         t,
       )
+      runCatching {
+        dao.updateGenerationTaskStatus(
+          bookId = bookId,
+          status = GenerationTaskStatus.ERROR.name,
+          updatedAtMs = System.currentTimeMillis(),
+          errorMessage = t.localizedMessage ?: "Error inesperado durante la síntesis de audio.",
+        )
+      }
       Result.failure(t as? Exception ?: RuntimeException(t))
     }
   }

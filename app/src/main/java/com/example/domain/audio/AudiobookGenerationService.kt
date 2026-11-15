@@ -24,12 +24,19 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.cancel
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 
 /**
- * Servicio en primer plano (`foregroundServiceType="dataSync"`) para sintetizar audiolibros completos
- * en segundo plano, con pantalla apagada o mientras la persona usuaria navega por otras pantallas.
+ * Servicio en primer plano para síntesis neuronal continua sin conexión con Piper + sherpa-onnx.
+ *
+ * - Android 15+ (API 35+): `mediaProcessing` (conversión prolongada de texto EPUB a WAV local)
+ *   con manejo explícito de `Service.onTimeout(startId, fgsType)` y reprogramación persistente.
+ * - Android 14 (API 34): `specialUse` declarado para compatibilidad previa a `mediaProcessing`.
+ * - WakeLock parcial: sin expiración fija de 2 horas; renovado periódicamente mientras existe
+ *   generación activa y liberado de inmediato al terminar, pausar, fallar, agotarse el timeout o destruirse.
  */
 class AudiobookGenerationService : Service() {
 
@@ -40,8 +47,12 @@ class AudiobookGenerationService : Service() {
 
   private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
   private var observerJob: Job? = null
+  private var stickyRestoreJob: Job? = null
+  private var wakeLockRenewalJob: Job? = null
   private var wakeLock: PowerManager.WakeLock? = null
   private var lastNotifiedSignature: String? = null
+  @Volatile private var activeStartId: Int = 0
+  @Volatile private var isRestoringStickyQueue: Boolean = false
 
   override fun onBind(intent: Intent?): IBinder? = null
 
@@ -51,48 +62,108 @@ class AudiobookGenerationService : Service() {
   }
 
   override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+    activeStartId = startId
     val action = intent?.action
     val bookId = intent?.getStringExtra(EXTRA_BOOK_ID)
-    Log.i(TAG, "onStartCommand(action=$action, bookId=$bookId)")
+    Log.i(TAG, "onStartCommand(startId=$startId, action=$action, bookId=$bookId)")
 
     if (action == ACTION_CANCEL_GENERATION) {
+      isRestoringStickyQueue = false
+      stickyRestoreJob?.cancel()
+      stickyRestoreJob = null
       if (!bookId.isNullOrBlank()) {
         repository.cancelAudiobookGeneration(bookId)
       } else {
         repository.cancelAllGenerations()
       }
       if (!repository.hasActiveOrQueuedGenerations()) {
-        releaseWakeLock()
-        ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-        stopSelf()
+        stopServiceCleanly(startId)
       }
       return START_NOT_STICKY
     }
 
+    // Si llega un reinicio sin EXTRA_BOOK_ID (START_STICKY tras cierre del SO), proteger la ventana
+    // de consulta a Room antes de arrancar observerJob/WakeLock para evitar auto-detención prematura.
+    val isStickyOrResumeAll = bookId.isNullOrBlank()
+    isRestoringStickyQueue = isStickyOrResumeAll
+
     // Llamar a startForeground de inmediato para cumplir con el contrato estricto de Android 12–16
-    // (evita ForegroundServiceDidNotStartInTimeException incluso antes de lanzar la corrutina).
+    // (evita ForegroundServiceDidNotStartInTimeException incluso antes de consultar Room).
     val initialProgress =
       if (!bookId.isNullOrBlank()) repository.generationProgress.value[bookId] else null
     startForegroundCompat(buildGenerationNotification(initialProgress, bookId))
-    acquireWakeLock()
+    ensureWakeLockHeldAndRenewing()
     startObservingProgress()
 
     if (!bookId.isNullOrBlank()) {
+      stickyRestoreJob?.cancel()
+      stickyRestoreJob = null
       repository.enqueueAudiobookGeneration(bookId)
-    } else if (!repository.hasActiveOrQueuedGenerations()) {
-      releaseWakeLock()
-      ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
-      stopSelf()
+      return START_STICKY
     }
 
-    return START_NOT_STICKY
+    // Reinicio del sistema vía START_STICKY (intent == null) o llamada sin EXTRA_BOOK_ID:
+    // reconstruir la cola persistida desde Room antes de decidir si detener el servicio.
+    stickyRestoreJob?.cancel()
+    stickyRestoreJob =
+      serviceScope.launch {
+        val restored =
+          try {
+            runCatching { repository.restoreRecoverableGenerations(startServiceIfNeeded = false) }
+              .onFailure { err -> Log.e(TAG, "Error restaurando cola persistente en START_STICKY", err) }
+              .getOrDefault(false)
+          } finally {
+            isRestoringStickyQueue = false
+          }
+        if (!restored || !repository.hasActiveOrQueuedGenerations()) {
+          if (!repository.hasActiveOrQueuedGenerations()) {
+            Log.i(TAG, "Sin tareas recuperables en Room tras START_STICKY; cerrando servicio.")
+            stopServiceCleanly(activeStartId)
+          }
+        } else {
+          ensureWakeLockHeldAndRenewing()
+        }
+      }
+
+    return START_STICKY
+  }
+
+  override fun onTimeout(startId: Int, fgsType: Int) {
+    Log.w(
+      TAG,
+      "onTimeout recibido del sistema (startId=$startId, fgsType=$fgsType). " +
+        "Guardando checkpoint e interrumpiendo limpiamente para reanudación automática.",
+    )
+    isRestoringStickyQueue = false
+    stickyRestoreJob?.cancel()
+    stickyRestoreJob = null
+    runCatching { repository.handleOsServiceTimeout() }.onFailure { err ->
+      Log.e(TAG, "Error guardando estado durante onTimeout", err)
+    }
+    stopServiceCleanly(startId)
   }
 
   override fun onDestroy() {
+    isRestoringStickyQueue = false
+    stickyRestoreJob?.cancel()
+    stickyRestoreJob = null
     observerJob?.cancel()
-    releaseWakeLock()
+    observerJob = null
+    stopWakeLockAndRenewal()
     serviceScope.cancel()
     super.onDestroy()
+  }
+
+  internal fun isWakeLockHeldForTesting(): Boolean = wakeLock?.isHeld == true
+
+  private fun stopServiceCleanly(targetStartId: Int = activeStartId) {
+    stopWakeLockAndRenewal()
+    ServiceCompat.stopForeground(this, ServiceCompat.STOP_FOREGROUND_REMOVE)
+    if (targetStartId > 0) {
+      stopSelf(targetStartId)
+    } else {
+      stopSelf()
+    }
   }
 
   private fun startObservingProgress() {
@@ -102,6 +173,7 @@ class AudiobookGenerationService : Service() {
         repository.generationProgress.collectLatest { progressMap ->
           val active = progressMap.values.firstOrNull { it.isRunning }
           if (active != null) {
+            acquireOrRenewWakeLock()
             val sig =
               "${active.bookId}|${active.phase}|${active.currentChapterNumber}|" +
                 "${active.currentChunkIndex}|${active.completedBookChunks}|${active.totalBookChunks}"
@@ -114,52 +186,60 @@ class AudiobookGenerationService : Service() {
                 buildGenerationNotification(active, active.bookId),
               )
             }
-          } else if (!repository.hasActiveOrQueuedGenerations()) {
-            Log.i(TAG, "Cola de generación vacía; finalizando servicio en primer plano.")
-            releaseWakeLock()
-            ServiceCompat.stopForeground(
-              this@AudiobookGenerationService,
-              ServiceCompat.STOP_FOREGROUND_REMOVE,
-            )
-            stopSelf()
+          } else if (!isRestoringStickyQueue && !repository.hasActiveOrQueuedGenerations()) {
+            Log.i(TAG, "Cola de generación vacía; liberando WakeLock y cerrando servicio.")
+            stopServiceCleanly(activeStartId)
           }
         }
       }
   }
 
   private fun startForegroundCompat(notification: Notification) {
-    val type =
-      if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
-        ServiceInfo.FOREGROUND_SERVICE_TYPE_DATA_SYNC
-      } else {
-        0
-      }
+    val type = foregroundServiceTypeForSdk(Build.VERSION.SDK_INT)
     ServiceCompat.startForeground(this, NOTIFICATION_ID, notification, type)
   }
 
-  private fun acquireWakeLock() {
-    if (wakeLock?.isHeld == true) return
-    runCatching {
-      val pm = getSystemService(Context.POWER_SERVICE) as? PowerManager ?: return
-      wakeLock =
-        pm.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG).apply {
-          setReferenceCounted(false)
-          acquire(WAKELOCK_TIMEOUT_MS)
+  private fun ensureWakeLockHeldAndRenewing() {
+    acquireOrRenewWakeLock()
+    if (wakeLockRenewalJob?.isActive == true) return
+    wakeLockRenewalJob =
+      serviceScope.launch {
+        while (isActive) {
+          delay(WAKE_LOCK_RENEW_INTERVAL_MS)
+          if (isRestoringStickyQueue || repository.hasActiveOrQueuedGenerations()) {
+            acquireOrRenewWakeLock()
+          } else {
+            stopWakeLockAndRenewal()
+            break
+          }
         }
-    }.onFailure { err ->
-      Log.w(TAG, "No se pudo adquirir WakeLock parcial", err)
-    }
+      }
   }
 
-  private fun releaseWakeLock() {
+  private fun acquireOrRenewWakeLock() {
     runCatching {
-      if (wakeLock?.isHeld == true) {
-        wakeLock?.release()
+        val lock =
+          wakeLock
+            ?: (getSystemService(Context.POWER_SERVICE) as? PowerManager)
+              ?.newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, WAKELOCK_TAG)
+              ?.apply { setReferenceCounted(false) }
+              ?.also { wakeLock = it }
+            ?: return
+        lock.acquire(WAKE_LOCK_LEASE_MS)
       }
-      wakeLock = null
-    }.onFailure { err ->
-      Log.w(TAG, "Error liberando WakeLock parcial", err)
-    }
+      .onFailure { err -> Log.w(TAG, "No se pudo adquirir/renovar WakeLock parcial", err) }
+  }
+
+  private fun stopWakeLockAndRenewal() {
+    wakeLockRenewalJob?.cancel()
+    wakeLockRenewalJob = null
+    runCatching {
+        if (wakeLock?.isHeld == true) {
+          wakeLock?.release()
+        }
+        wakeLock = null
+      }
+      .onFailure { err -> Log.w(TAG, "Error liberando WakeLock parcial", err) }
   }
 
   private fun ensureNotificationChannel() {
@@ -249,7 +329,20 @@ class AudiobookGenerationService : Service() {
     const val ACTION_CANCEL_GENERATION = "com.example.action.CANCEL_GENERATION"
     const val EXTRA_BOOK_ID = "extra_book_id"
     private const val WAKELOCK_TAG = "Audiolibro:GenerationWakeLock"
-    private const val WAKELOCK_TIMEOUT_MS = 2L * 60L * 60L * 1000L
+
+    // Ventana de concesión segura renovada automáticamente cada 5 min mientras dura la generación,
+    // sin límite fijo de 2 horas que interrumpa audiolibros extensos.
+    internal const val WAKE_LOCK_LEASE_MS = 15L * 60L * 1000L
+    internal const val WAKE_LOCK_RENEW_INTERVAL_MS = 5L * 60L * 1000L
+
+    internal fun foregroundServiceTypeForSdk(sdkInt: Int): Int =
+      when {
+        sdkInt >= Build.VERSION_CODES.VANILLA_ICE_CREAM ->
+          ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING
+        sdkInt >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE ->
+          ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE
+        else -> 0
+      }
 
     fun startBookGeneration(context: Context, bookId: String) {
       val intent =

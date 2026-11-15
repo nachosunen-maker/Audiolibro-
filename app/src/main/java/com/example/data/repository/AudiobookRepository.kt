@@ -2,16 +2,19 @@ package com.example.data.repository
 
 import android.content.Context
 import android.net.Uri
-import android.util.Log
 import android.provider.OpenableColumns
+import android.util.Log
+import androidx.work.ListenableWorker
 import com.example.data.local.AppDatabase
 import com.example.data.local.AudiobookDao
 import com.example.data.local.BookEntity
 import com.example.data.local.ChapterEntity
+import com.example.data.local.GenerationTaskEntity
 import com.example.data.storage.AudiobookStorageManager
 import com.example.domain.audio.AudioSynthesisProvider
 import com.example.domain.audio.AudiobookGenerationOrchestrator
 import com.example.domain.audio.AudiobookGenerationService
+import com.example.domain.audio.AudiobookRecoveryScheduler
 import com.example.domain.audio.BookGenerationProgress
 import com.example.domain.audio.GenerationPhase
 import com.example.domain.audio.PiperAudioSynthesisProvider
@@ -19,14 +22,17 @@ import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.Book
 import com.example.domain.model.BookWithChapters
 import com.example.domain.model.Chapter
+import com.example.domain.model.GenerationTaskStatus
 import com.example.domain.model.NarratorVoice
 import com.example.epub.EpubParseException
 import com.example.epub.EpubParser
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CoroutineStart
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.SupervisorJob
@@ -38,6 +44,9 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.runBlocking
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
 
 class AudiobookRepository(
@@ -67,10 +76,13 @@ class AudiobookRepository(
     }
   private val generationScope =
     CoroutineScope(SupervisorJob() + Dispatchers.IO + generationExceptionHandler)
+  private val taskPersistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+  private val taskDbMutex = Mutex()
   private val queueLock = Any()
   private val pendingBookIds = ArrayDeque<String>()
   @Volatile private var activeBookId: String? = null
   @Volatile private var activeJob: Job? = null
+  private val osTimeoutInProgress = AtomicBoolean(false)
 
   private val _generationProgress =
     MutableStateFlow<Map<String, BookGenerationProgress>>(emptyMap())
@@ -91,6 +103,9 @@ class AudiobookRepository(
 
   fun observeChapter(bookId: String, chapterIndex: Int): Flow<Chapter?> =
     dao.observeChapter(bookId, chapterIndex).map { it?.toDomain() }
+
+  fun observeGenerationTask(bookId: String): Flow<GenerationTaskEntity?> =
+    dao.observeGenerationTask(bookId)
 
   suspend fun importEpub(uri: Uri): Result<Book> =
     withContext(Dispatchers.IO) {
@@ -195,13 +210,19 @@ class AudiobookRepository(
     }
 
   /**
-   * Punto de entrada desde la interfaz gráfica: inicia el servicio en primer plano
-   * (`AudiobookGenerationService`, tipo `dataSync`) para mantener la síntesis activa en segundo plano
-   * o con la pantalla apagada. Si el sistema restringe FGS, continúa en `enqueueAudiobookGeneration`.
+   * Punto de entrada desde la interfaz gráfica: persiste la tarea en Room, inicia el servicio
+   * en primer plano (`mediaProcessing` en Android 15+, `specialUse` en Android 14) y programa el
+   * respaldo persistente en WorkManager para mantener la síntesis activa ante cualquier corte del SO.
    */
   fun requestAudiobookGeneration(bookId: String) {
     Log.i(TAG_GEN, "requestAudiobookGeneration(bookId=$bookId) -> iniciando servicio en primer plano")
+    osTimeoutInProgress.set(false)
     clearGenerationError(bookId)
+
+    taskPersistenceScope.launch {
+      persistQueuedTaskLocked(bookId, forceQueuedStatus = true)
+    }
+
     val startedService =
       runCatching {
           AudiobookGenerationService.startBookGeneration(context.applicationContext, bookId)
@@ -218,6 +239,11 @@ class AudiobookRepository(
 
     if (!startedService) {
       enqueueAudiobookGeneration(bookId)
+      AudiobookRecoveryScheduler.scheduleRecovery(
+        context = context.applicationContext,
+        initialDelaySeconds = 15L,
+        replaceExisting = false,
+      )
     }
   }
 
@@ -226,6 +252,7 @@ class AudiobookRepository(
   }
 
   fun enqueueAudiobookGeneration(bookId: String) {
+    osTimeoutInProgress.set(false)
     val shouldLaunch =
       synchronized(queueLock) {
         if (activeBookId == bookId && activeJob?.isActive == true) {
@@ -253,6 +280,10 @@ class AudiobookRepository(
         activeJob?.isActive != true
       }
 
+    taskPersistenceScope.launch {
+      persistQueuedTaskLocked(bookId, forceQueuedStatus = false)
+    }
+
     if (shouldLaunch) {
       launchNextQueuedJob()
     }
@@ -261,6 +292,197 @@ class AudiobookRepository(
   fun hasActiveOrQueuedGenerations(): Boolean =
     synchronized(queueLock) { activeJob?.isActive == true || pendingBookIds.isNotEmpty() }
 
+  /**
+   * Inspecciona Room al arranque del proceso, regreso al primer plano o reinicio de `START_STICKY`
+   * y reanuda automáticamente cualquier tarea en estado `QUEUED`, `RUNNING` o `INTERRUPTED_BY_OS`
+   * sin requerir intervención del usuario y sin tocar tareas `PAUSED_BY_USER`, `COMPLETED` ni `ERROR`.
+   */
+  suspend fun restoreRecoverableGenerations(startServiceIfNeeded: Boolean = true): Boolean =
+    withContext(Dispatchers.IO) {
+      val recoverable =
+        taskDbMutex.withLock {
+          dao.getRecoverableGenerationTasksOnce()
+        }
+      if (recoverable.isEmpty()) {
+        return@withContext false
+      }
+
+      if (hasActiveOrQueuedGenerations()) {
+        return@withContext true
+      }
+
+      val now = System.currentTimeMillis()
+      for (task in recoverable) {
+        if (task.parsedStatus() == GenerationTaskStatus.RUNNING || task.parsedStatus() == GenerationTaskStatus.INTERRUPTED_BY_OS) {
+          taskDbMutex.withLock {
+            dao.updateGenerationTaskStatus(
+              bookId = task.bookId,
+              status = GenerationTaskStatus.QUEUED.name,
+              updatedAtMs = now,
+              errorMessage = null,
+            )
+          }
+        }
+      }
+
+      val firstBookId = recoverable.first().bookId
+      synchronized(queueLock) {
+        for (task in recoverable) {
+          if (!pendingBookIds.contains(task.bookId)) {
+            pendingBookIds.addLast(task.bookId)
+          }
+          _generationProgress.update { map ->
+            map +
+              (task.bookId to
+                BookGenerationProgress(
+                  bookId = task.bookId,
+                  isRunning = true,
+                  phase = GenerationPhase.RESUMING,
+                  completedBookChunks = task.completedChunks,
+                  totalBookChunks = task.totalChunks,
+                  statusMessage =
+                    "Reanudando generación automáticamente (${task.completedChunks}/${task.totalChunks} fragmentos)…",
+                ))
+          }
+        }
+      }
+
+      if (startServiceIfNeeded) {
+        val started =
+          runCatching {
+              AudiobookGenerationService.startBookGeneration(context.applicationContext, firstBookId)
+              true
+            }
+            .onFailure { err ->
+              Log.w(
+                TAG_GEN,
+                "FGS no permitido al restaurar cola en segundo plano; programando WorkManager",
+                err,
+              )
+            }
+            .getOrDefault(false)
+
+        if (!started) {
+          AudiobookRecoveryScheduler.scheduleRecovery(
+            context = context.applicationContext,
+            initialDelaySeconds = 2L,
+            replaceExisting = true,
+          )
+        }
+      } else {
+        launchNextQueuedJob()
+      }
+      true
+    }
+
+  internal fun tryStartForegroundServiceForRecovery(): Boolean {
+    val firstBookId =
+      runBlocking {
+        taskDbMutex.withLock { dao.getRecoverableGenerationTasksOnce().firstOrNull()?.bookId }
+      } ?: return false
+    return runCatching {
+        AudiobookGenerationService.startBookGeneration(context.applicationContext, firstBookId)
+        true
+      }
+      .onFailure { err ->
+        Log.w(TAG_GEN, "Sistema restringió FGS desde WorkManager para bookId=$firstBookId", err)
+      }
+      .getOrDefault(false)
+  }
+
+  /**
+   * Gestiona `Service.onTimeout(startId, fgsType)` de Android 15+ sin marcar la tarea como
+   * cancelación del usuario: conserva todos los fragmentos WAV completados, marca el libro activo
+   * como `INTERRUPTED_BY_OS`, libera la cola en memoria y programa reanudación automática en WorkManager.
+   */
+  fun handleOsServiceTimeout() {
+    osTimeoutInProgress.set(true)
+    val affected =
+      synchronized(queueLock) {
+        val ids = mutableListOf<String>()
+        activeBookId?.let { ids += it }
+        ids += pendingBookIds
+        pendingBookIds.clear()
+        Pair(ids.distinct(), activeJob)
+      }
+
+    val now = System.currentTimeMillis()
+    runBlocking(Dispatchers.IO) {
+      taskDbMutex.withLock {
+        dao.markRunningTasksInterruptedByOs(now)
+      }
+    }
+
+    affected.second?.cancel(CancellationException("OS_FGS_TIMEOUT"))
+
+    _generationProgress.update { map ->
+      var updated = map
+      for (id in affected.first) {
+        val cur = updated[id]
+        if (cur != null) {
+          updated =
+            updated +
+              (id to
+                cur.copy(
+                  isRunning = false,
+                  phase = GenerationPhase.INTERRUPTED,
+                  statusMessage =
+                    "Límite temporal del sistema alcanzado. La generación se reanudará automáticamente.",
+                ))
+        }
+      }
+      updated
+    }
+
+    AudiobookRecoveryScheduler.scheduleRecovery(
+      context = context.applicationContext,
+      initialDelaySeconds = 5L,
+      replaceExisting = true,
+    )
+  }
+
+  internal suspend fun runRecoverableTasksInWorker(): ListenableWorker.Result {
+    val tasks = taskDbMutex.withLock { dao.getRecoverableGenerationTasksOnce() }
+    if (tasks.isEmpty()) return ListenableWorker.Result.success()
+    if (hasActiveOrQueuedGenerations()) return ListenableWorker.Result.success()
+
+    for (task in tasks) {
+      val result =
+        try {
+          orchestrator.generateBookAudiobook(task.bookId) { progress ->
+            _generationProgress.update { map -> map + (task.bookId to progress) }
+          }
+        } catch (e: CancellationException) {
+          // Worker detenido temporalmente por el SO: marcar INTERRUPTED_BY_OS y solicitar reintento.
+          val now = System.currentTimeMillis()
+          taskDbMutex.withLock {
+            val cur = dao.getGenerationTaskOnce(task.bookId)
+            if (cur != null && cur.parsedStatus() != GenerationTaskStatus.PAUSED_BY_USER) {
+              dao.updateGenerationTaskStatus(
+                bookId = task.bookId,
+                status = GenerationTaskStatus.INTERRUPTED_BY_OS.name,
+                updatedAtMs = now,
+                errorMessage = null,
+              )
+            }
+          }
+          return ListenableWorker.Result.retry()
+        }
+
+      if (result.isFailure) {
+        val err = result.exceptionOrNull()
+        Log.e(TAG_GEN, "Worker de recuperación falló en bookId=${task.bookId}", err)
+      }
+    }
+
+    val remaining = taskDbMutex.withLock { dao.getRecoverableGenerationTasksOnce() }
+    return if (remaining.isEmpty()) {
+      ListenableWorker.Result.success()
+    } else {
+      ListenableWorker.Result.retry()
+    }
+  }
+
   private fun launchNextQueuedJob() {
     val nextBookId =
       synchronized(queueLock) {
@@ -268,10 +490,28 @@ class AudiobookRepository(
         val id = pendingBookIds.removeFirstOrNull()
         activeBookId = id
         id
-      } ?: return
+      }
+
+    if (nextBookId == null) {
+      // Comprobar también en Room por si hay tareas QUEUED persistidas pendientes tras una recuperación.
+      val persistedJob =
+        generationScope.launch {
+          val dbNext =
+            taskDbMutex.withLock { dao.getRecoverableGenerationTasksOnce().firstOrNull()?.bookId }
+          if (dbNext != null) {
+            enqueueAudiobookGeneration(dbNext)
+          }
+        }
+      synchronized(queueLock) {
+        if (activeJob == null) {
+          activeJob = persistedJob
+        }
+      }
+      return
+    }
 
     val job =
-      generationScope.launch {
+      generationScope.launch(start = CoroutineStart.LAZY) {
         try {
           val result =
             orchestrator.generateBookAudiobook(nextBookId) { progress ->
@@ -302,6 +542,7 @@ class AudiobookRepository(
           }
         } catch (e: CancellationException) {
           Log.i(TAG_GEN, "Generación interrumpida/pausada para bookId=$nextBookId")
+          val pausedByOsTimeout = osTimeoutInProgress.get()
           _generationProgress.update { map ->
             val current = map[nextBookId]
             if (current != null) {
@@ -310,7 +551,12 @@ class AudiobookRepository(
                   current.copy(
                     isRunning = false,
                     phase = GenerationPhase.INTERRUPTED,
-                    statusMessage = "Generación interrumpida. El progreso guardado se conserva.",
+                    statusMessage =
+                      if (pausedByOsTimeout) {
+                        "Límite temporal del sistema alcanzado. Se reanudará automáticamente."
+                      } else {
+                        "Generación pausada. El progreso guardado se conserva."
+                      },
                   ))
             } else {
               map
@@ -349,8 +595,26 @@ class AudiobookRepository(
               }
               pendingBookIds.isNotEmpty()
             }
-          if (hasMore) {
+          if (hasMore && !osTimeoutInProgress.get()) {
             launchNextQueuedJob()
+          } else if (!hasMore && !osTimeoutInProgress.get()) {
+            // Si aún quedan tareas QUEUED en Room que entraron mientras corría este libro, continuarlas.
+            val dbRemaining =
+              runCatching {
+                  taskDbMutex.withLock { dao.getRecoverableGenerationTasksOnce() }
+                }
+                .getOrDefault(emptyList())
+                .filter { it.bookId != nextBookId }
+            if (dbRemaining.isNotEmpty()) {
+              synchronized(queueLock) {
+                dbRemaining.forEach { t ->
+                  if (!pendingBookIds.contains(t.bookId)) pendingBookIds.addLast(t.bookId)
+                }
+              }
+              launchNextQueuedJob()
+            } else {
+              AudiobookRecoveryScheduler.cancelRecovery(context.applicationContext)
+            }
           }
         }
       }
@@ -358,6 +622,7 @@ class AudiobookRepository(
     synchronized(queueLock) {
       activeJob = job
     }
+    job.start()
   }
 
   fun cancelAudiobookGeneration(bookId: String) {
@@ -366,6 +631,28 @@ class AudiobookRepository(
         pendingBookIds.remove(bookId)
         if (activeBookId == bookId) activeJob else null
       }
+
+    // Persistir PAUSED_BY_USER antes de cancelar la corrutina para que la cola persistente
+    // distinga la pausa explícita del usuario frente a una muerte del proceso por el SO.
+    taskPersistenceScope.launch {
+      taskDbMutex.withLock {
+        val existing = dao.getGenerationTaskOnce(bookId)
+        if (existing != null) {
+          dao.updateGenerationTaskStatus(
+            bookId = bookId,
+            status = GenerationTaskStatus.PAUSED_BY_USER.name,
+            updatedAtMs = System.currentTimeMillis(),
+            errorMessage = null,
+          )
+        }
+      }
+      val anyOtherRecoverable =
+        taskDbMutex.withLock { dao.getRecoverableGenerationTasksOnce().isNotEmpty() }
+      if (!anyOtherRecoverable) {
+        AudiobookRecoveryScheduler.cancelRecovery(context.applicationContext)
+      }
+    }
+
     jobToCancel?.cancel()
     _generationProgress.update { map ->
       val current = map[bookId]
@@ -375,7 +662,7 @@ class AudiobookRepository(
             current.copy(
               isRunning = false,
               phase = GenerationPhase.INTERRUPTED,
-              statusMessage = "Generación pausada. El progreso guardado se conserva.",
+              statusMessage = "Generación pausada por el usuario. El progreso guardado se conserva.",
             ))
       } else {
         map
@@ -389,8 +676,27 @@ class AudiobookRepository(
         val ids = pendingBookIds.toList()
         pendingBookIds.clear()
         val runningId = activeBookId
-        Pair(ids + listOfNotNull(runningId), activeJob)
+        Pair((ids + listOfNotNull(runningId)).distinct(), activeJob)
       }
+
+    taskPersistenceScope.launch {
+      val now = System.currentTimeMillis()
+      taskDbMutex.withLock {
+        for (id in active.first) {
+          val existing = dao.getGenerationTaskOnce(id)
+          if (existing != null) {
+            dao.updateGenerationTaskStatus(
+              bookId = id,
+              status = GenerationTaskStatus.PAUSED_BY_USER.name,
+              updatedAtMs = now,
+              errorMessage = null,
+            )
+          }
+        }
+      }
+      AudiobookRecoveryScheduler.cancelRecovery(context.applicationContext)
+    }
+
     active.second?.cancel()
     _generationProgress.update { map ->
       var updated = map
@@ -403,7 +709,7 @@ class AudiobookRepository(
                 cur.copy(
                   isRunning = false,
                   phase = GenerationPhase.INTERRUPTED,
-                  statusMessage = "Generación pausada. El progreso guardado se conserva.",
+                  statusMessage = "Generación pausada por el usuario. El progreso guardado se conserva.",
                 ))
         }
       }
@@ -423,6 +729,41 @@ class AudiobookRepository(
               else GenerationPhase.IDLE,
             errorMessage = null,
           ))
+    }
+  }
+
+  private suspend fun persistQueuedTaskLocked(bookId: String, forceQueuedStatus: Boolean) {
+    taskDbMutex.withLock {
+      val book = dao.getBookOnce(bookId) ?: return@withLock
+      val existing = dao.getGenerationTaskOnce(bookId)
+      val now = System.currentTimeMillis()
+      if (existing == null) {
+        dao.upsertGenerationTask(
+          GenerationTaskEntity(
+            bookId = bookId,
+            queueOrder = now,
+            voiceName = book.selectedVoice,
+            status = GenerationTaskStatus.QUEUED.name,
+            currentChapterIndex = 0,
+            currentChunkIndex = 0,
+            completedChunks = 0,
+            totalChunks = 0,
+            startedAtMs = now,
+            updatedAtMs = now,
+            lastValidProgressAtMs = 0L,
+            errorMessage = null,
+          )
+        )
+      } else if (forceQueuedStatus || existing.parsedStatus() != GenerationTaskStatus.RUNNING) {
+        dao.upsertGenerationTask(
+          existing.copy(
+            voiceName = book.selectedVoice,
+            status = GenerationTaskStatus.QUEUED.name,
+            updatedAtMs = now,
+            errorMessage = null,
+          )
+        )
+      }
     }
   }
 

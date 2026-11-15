@@ -96,6 +96,7 @@ sealed interface BookDetailUiState {
     val data: BookWithChapters,
     val audioStorageBytes: Long,
     val generationProgress: BookGenerationProgress?,
+    val generationTask: com.example.data.local.GenerationTaskEntity? = null,
   ) : BookDetailUiState
 
   data object NotFound : BookDetailUiState
@@ -124,7 +125,8 @@ class BookDetailViewModel(
         repository.observeBookWithChapters(bookId),
         _storageBytes,
         repository.generationProgress.map { it[bookId] },
-      ) { bookWithChapters, storageBytes, progress ->
+        repository.observeGenerationTask(bookId),
+      ) { bookWithChapters, storageBytes, progress, task ->
         if (bookWithChapters == null) {
           BookDetailUiState.NotFound
         } else {
@@ -138,6 +140,7 @@ class BookDetailViewModel(
             data = bookWithChapters,
             audioStorageBytes = liveBytes,
             generationProgress = progress,
+            generationTask = task,
           )
         }
       }

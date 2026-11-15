@@ -59,15 +59,43 @@ jobs:
           gradle-version: '9.3.1'
           cache-provider: basic
 
-      - name: Build signed debug APK
+      - name: Run Kotlin unit and Robolectric tests
         run: |
           set -euo pipefail
-          gradle :app:assembleDebug --no-daemon --stacktrace
+          gradle :app:testDebugUnitTest --no-daemon --stacktrace
+
+      - name: Build and verify signed debug APK + ARM64 native TTS assets
+        run: |
+          set -euo pipefail
+          gradle :app:assembleDebug :app:compileDebugAndroidTestKotlin :app:reportOfflineApkSizes --no-daemon --stacktrace
           APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
           if [ ! -s "$APK_PATH" ]; then
             echo "::error::APK not found or empty at $APK_PATH"
             exit 1
           fi
+          python3 - "$APK_PATH" <<'PYEOF'
+          import sys, zipfile
+          apk = sys.argv[1]
+          required = [
+              "lib/arm64-v8a/libsherpa-onnx-jni.so",
+              "lib/arm64-v8a/libpiper-phonemize-jni.so",
+              "lib/arm64-v8a/libonnxruntime.so",
+              "assets/tts/vits-piper-es_ES-sharvard-medium/es_ES-sharvard-medium.onnx",
+              "assets/tts/vits-piper-es_ES-sharvard-medium/es_ES-sharvard-medium.onnx.json",
+              "assets/tts/vits-piper-es_ES-sharvard-medium/tokens.txt",
+              "assets/tts/vits-piper-es_ES-sharvard-medium/espeak-ng-data/es_dict",
+              "assets/tts/vits-piper-es_ES-sharvard-medium/espeak-ng-data/phontab",
+              "assets/tts/vits-piper-es_ES-sharvard-medium/espeak-ng-data/phonindex",
+              "assets/tts/vits-piper-es_ES-sharvard-medium/espeak-ng-data/phondata",
+              "assets/tts/vits-piper-es_ES-sharvard-medium/espeak-ng-data/intonations",
+          ]
+          with zipfile.ZipFile(apk) as z:
+              names = set(z.namelist())
+              missing = [r for r in required if r not in names]
+              if missing:
+                  raise SystemExit(f"Missing required offline ARM64 TTS artifacts in APK: {missing}")
+              print(f"OK: Verified all {len(required)} required ARM64 native libraries and SHARVARD assets inside {apk}.")
+          PYEOF
           echo "OK: APK generated successfully ($(wc -c < "$APK_PATH") bytes)"
 
       - name: Verify APK signature
@@ -76,12 +104,12 @@ jobs:
           SDK_DIR="${ANDROID_SDK_ROOT:-${ANDROID_HOME:-}}"
           APKSIGNER="$(find "$SDK_DIR/build-tools" -name apksigner -type f 2>/dev/null | sort -V | tail -n1 || true)"
           if [ -z "$APKSIGNER" ]; then
-            echo "::warning::apksigner not found in build-tools; skipping apksigner verify."
-          else
-            echo "Using apksigner: $APKSIGNER"
-            "$APKSIGNER" verify --verbose app/build/outputs/apk/debug/app-debug.apk
-            echo "OK: APK signature verified successfully."
+            echo "::error::apksigner not found in build-tools"
+            exit 1
           fi
+          echo "Using apksigner: $APKSIGNER"
+          "$APKSIGNER" verify --verbose app/build/outputs/apk/debug/app-debug.apk
+          echo "OK: APK signature verified successfully."
 
       - name: Upload Debug APK
         uses: actions/upload-artifact@v4

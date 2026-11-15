@@ -12,6 +12,7 @@ import org.gradle.api.file.DirectoryProperty
 import org.gradle.api.file.RegularFileProperty
 import org.gradle.api.provider.Property
 import org.gradle.api.tasks.Input
+import org.gradle.api.tasks.InputFile
 import org.gradle.api.tasks.OutputDirectory
 import org.gradle.api.tasks.OutputFile
 import org.gradle.api.tasks.TaskAction
@@ -136,9 +137,12 @@ val preparePiperTtsAssets =
 
 tasks.named("preBuild") { dependsOn(preparePiperTtsAssets) }
 
-tasks.register("reportOfflineApkSizes") {
-  doLast {
-    val apk = layout.buildDirectory.file("outputs/apk/debug/app-debug.apk").get().asFile
+abstract class ReportOfflineApkSizesTask : DefaultTask() {
+  @get:InputFile abstract val apkFile: RegularFileProperty
+
+  @TaskAction
+  fun report() {
+    val apk = apkFile.get().asFile
     check(apk.exists()) { "APK not found at ${apk.absolutePath}" }
     println("APK_TOTAL_BYTES=${apk.length()}")
     java.util.zip.ZipFile(apk).use { zip ->
@@ -190,5 +194,10 @@ tasks.register("reportOfflineApkSizes") {
       println("OTHER:raw=$otherRaw,comp=$otherCompressed")
     }
   }
+}
+
+tasks.register<ReportOfflineApkSizesTask>("reportOfflineApkSizes") {
+  dependsOn("assembleDebug")
+  apkFile.set(layout.buildDirectory.file("outputs/apk/debug/app-debug.apk"))
 }
 

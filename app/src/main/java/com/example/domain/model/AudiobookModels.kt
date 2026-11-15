@@ -55,6 +55,23 @@ enum class ChapterChunkStatus {
   }
 }
 
+enum class GenerationTaskStatus {
+  QUEUED,
+  RUNNING,
+  INTERRUPTED_BY_OS,
+  PAUSED_BY_USER,
+  COMPLETED,
+  ERROR;
+
+  val isRecoverable: Boolean
+    get() = this == QUEUED || this == RUNNING || this == INTERRUPTED_BY_OS
+
+  companion object {
+    fun fromNameOrDefault(raw: String?): GenerationTaskStatus =
+      entries.firstOrNull { it.name == raw } ?: QUEUED
+  }
+}
+
 data class Book(
   val id: String,
   val title: String,

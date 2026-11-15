@@ -268,6 +268,7 @@ fun BookDetailScreen(
                   bookWithChapters = bookWithChapters,
                   audioProvider = viewModel.audioProvider,
                   progress = state.generationProgress,
+                  generationTask = state.generationTask,
                   onGenerate = startGenerationWithNotificationCheck,
                   onCancel = viewModel::cancelGeneration,
                   onDismissError = viewModel::clearGenerationError,
@@ -687,6 +688,7 @@ private fun AudiobookGenerationSection(
   bookWithChapters: BookWithChapters,
   audioProvider: AudioSynthesisProvider,
   progress: BookGenerationProgress?,
+  generationTask: com.example.data.local.GenerationTaskEntity?,
   onGenerate: () -> Unit,
   onCancel: () -> Unit,
   onDismissError: () -> Unit,
@@ -701,13 +703,25 @@ private fun AudiobookGenerationSection(
   val hasStaleGenerating =
     !isRunning && chapters.any { it.audioStatus == AudioGenerationStatus.GENERATING }
   val hasPartialChunks = chapters.any { it.generatedChunks > 0 }
+  val taskStatus = generationTask?.parsedStatus()
+  val isAutoRecoverPending =
+    !isRunning &&
+      !bookWithChapters.isCompleteAudiobookReady &&
+      taskStatus?.isRecoverable == true
   val hasPartialProgress =
     !bookWithChapters.isCompleteAudiobookReady &&
       (readyCount > 0 || hasPartialChunks || hasStaleGenerating ||
-        progress?.phase == GenerationPhase.INTERRUPTED)
+        progress?.phase == GenerationPhase.INTERRUPTED ||
+        taskStatus == com.example.domain.model.GenerationTaskStatus.PAUSED_BY_USER ||
+        isAutoRecoverPending)
   val persistedChapterError =
     chapters.firstOrNull { it.audioStatus == AudioGenerationStatus.ERROR }?.generationError
-  val effectiveErrorMessage = progress?.errorMessage ?: persistedChapterError
+  val effectiveErrorMessage =
+    progress?.errorMessage
+      ?: persistedChapterError
+      ?: generationTask?.errorMessage?.takeIf {
+        taskStatus == com.example.domain.model.GenerationTaskStatus.ERROR
+      }
 
   Surface(
     modifier = Modifier.fillMaxWidth(),
@@ -844,6 +858,19 @@ private fun AudiobookGenerationSection(
           )
         }
       } else if (hasPartialProgress && effectiveErrorMessage.isNullOrBlank()) {
+        val bannerTitle =
+          when {
+            isAutoRecoverPending -> "Generación en cola · reanudación automática activa"
+            taskStatus == com.example.domain.model.GenerationTaskStatus.PAUSED_BY_USER ->
+              "Generación pausada por el usuario"
+            else -> "Generación interrumpida · pendiente de reanudación"
+          }
+        val bannerBody =
+          if (isAutoRecoverPending) {
+            "Los fragmentos y capítulos ya sintetizados permanecen guardados. La cola persistente reanudará automáticamente sin empezar desde cero."
+          } else {
+            "Los fragmentos y capítulos ya sintetizados permanecen guardados. Pulsa «Reanudar generación» para continuar sin empezar desde cero."
+          }
         Surface(
           modifier = Modifier.fillMaxWidth().testTag("generation_interrupted_banner"),
           shape = MaterialTheme.shapes.medium,
@@ -855,13 +882,12 @@ private fun AudiobookGenerationSection(
             verticalArrangement = Arrangement.spacedBy(4.dp),
           ) {
             Text(
-              text = "Generación interrumpida · pendiente de reanudación",
+              text = bannerTitle,
               style = MaterialTheme.typography.labelLarge,
               color = MaterialTheme.colorScheme.onTertiaryContainer,
             )
             Text(
-              text =
-                "Los fragmentos y capítulos ya sintetizados permanecen guardados. Pulsa «Reanudar generación» para continuar sin empezar desde cero.",
+              text = bannerBody,
               style = MaterialTheme.typography.bodySmall,
               color = MaterialTheme.colorScheme.onTertiaryContainer,
             )

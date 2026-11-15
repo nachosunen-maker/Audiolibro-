@@ -133,9 +133,7 @@ class SherpaOnnxLocalTtsEngine(
     check(tokensFile.exists() && tokensFile.length() > 200L) {
       "El archivo tokens.txt no existe o está incompleto: ${tokensFile.absolutePath} (${tokensFile.length()} bytes)"
     }
-    check(File(espeakDir, "es_dict").exists() && File(espeakDir, "phontab").exists()) {
-      "Los datos fonéticos eSpeak NG faltan en ${espeakDir.absolutePath}"
-    }
+    PiperNativePhonemizer.resolveAndValidateEspeakDataDir(espeakDir.absolutePath)
 
     val threads = Runtime.getRuntime().availableProcessors().coerceIn(2, 4)
 
@@ -199,10 +197,10 @@ class SherpaOnnxLocalTtsEngine(
 
     Log.i(
       TAG,
-      "[Fase 3/5] Inicializando fonemizador nativo eSpeak NG (piper-phonemize) en ${modelDir.absolutePath}...",
+      "[Fase 3/5] Inicializando fonemizador nativo eSpeak NG (piper-phonemize) con espeakDir=${espeakDir.absolutePath}...",
     )
     try {
-      phonemizer.initialize(modelDir.absolutePath)
+      phonemizer.initialize(espeakDir.absolutePath)
     } catch (t: Throwable) {
       runCatching { engine.release() }
       throw t
@@ -313,7 +311,7 @@ class SherpaOnnxLocalTtsEngine(
     const val CONFIG_FILENAME = "es_ES-sharvard-medium.onnx.json"
     const val TOKENS_FILENAME = "tokens.txt"
     const val ESPEAK_DIR_NAME = "espeak-ng-data"
-    private const val EXTRACTION_MARKER_FILE = ".model_extracted_ready_v4"
+    private const val EXTRACTION_MARKER_FILE = ".model_extracted_ready_v5"
 
     fun hasBundledModelAssets(assets: AssetManager): Boolean {
       return assetExists(assets, "$ASSET_MODEL_DIR/$MODEL_FILENAME") &&
@@ -322,7 +320,8 @@ class SherpaOnnxLocalTtsEngine(
         assetExists(assets, "$ASSET_MODEL_DIR/$ESPEAK_DIR_NAME/es_dict") &&
         assetExists(assets, "$ASSET_MODEL_DIR/$ESPEAK_DIR_NAME/phontab") &&
         assetExists(assets, "$ASSET_MODEL_DIR/$ESPEAK_DIR_NAME/phonindex") &&
-        assetExists(assets, "$ASSET_MODEL_DIR/$ESPEAK_DIR_NAME/phondata")
+        assetExists(assets, "$ASSET_MODEL_DIR/$ESPEAK_DIR_NAME/phondata") &&
+        assetExists(assets, "$ASSET_MODEL_DIR/$ESPEAK_DIR_NAME/intonations")
     }
 
     private fun assetExists(assets: AssetManager, assetPath: String): Boolean {
@@ -362,6 +361,7 @@ class SherpaOnnxLocalTtsEngine(
       val requiredPhontab = File(baseTargetDir, "$ESPEAK_DIR_NAME/phontab")
       val requiredPhonindex = File(baseTargetDir, "$ESPEAK_DIR_NAME/phonindex")
       val requiredPhondata = File(baseTargetDir, "$ESPEAK_DIR_NAME/phondata")
+      val requiredIntonations = File(baseTargetDir, "$ESPEAK_DIR_NAME/intonations")
 
       val isValid =
         markerFile.exists() &&
@@ -376,7 +376,9 @@ class SherpaOnnxLocalTtsEngine(
           requiredPhonindex.exists() &&
           requiredPhonindex.length() > 1000L &&
           requiredPhondata.exists() &&
-          requiredPhondata.length() > 1000L
+          requiredPhondata.length() > 1000L &&
+          requiredIntonations.exists() &&
+          requiredIntonations.length() > 100L
 
       if (isValid) {
         return baseTargetDir
@@ -405,7 +407,9 @@ class SherpaOnnxLocalTtsEngine(
           requiredPhonindex.exists() &&
           requiredPhonindex.length() > 1000L &&
           requiredPhondata.exists() &&
-          requiredPhondata.length() > 1000L
+          requiredPhondata.length() > 1000L &&
+          requiredIntonations.exists() &&
+          requiredIntonations.length() > 100L
 
       check(checkValid) {
         "Extracción incompleta o corrupta de los archivos del modelo $MODEL_ID en ${baseTargetDir.absolutePath}."

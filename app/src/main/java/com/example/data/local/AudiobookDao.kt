@@ -118,8 +118,84 @@ interface AudiobookDao {
     resetStatus: String = AudioGenerationStatus.NOT_GENERATED.name,
   )
 
+  @Query("SELECT * FROM generation_tasks WHERE bookId = :bookId LIMIT 1")
+  fun observeGenerationTask(bookId: String): Flow<GenerationTaskEntity?>
+
+  @Query("SELECT * FROM generation_tasks ORDER BY queueOrder ASC, startedAtMs ASC")
+  fun observeAllGenerationTasks(): Flow<List<GenerationTaskEntity>>
+
+  @Query("SELECT * FROM generation_tasks WHERE bookId = :bookId LIMIT 1")
+  suspend fun getGenerationTaskOnce(bookId: String): GenerationTaskEntity?
+
+  @Query(
+    """
+    SELECT * FROM generation_tasks
+    WHERE status IN ('QUEUED', 'RUNNING', 'INTERRUPTED_BY_OS')
+    ORDER BY queueOrder ASC, startedAtMs ASC
+    """
+  )
+  suspend fun getRecoverableGenerationTasksOnce(): List<GenerationTaskEntity>
+
+  @Insert(onConflict = OnConflictStrategy.REPLACE)
+  suspend fun upsertGenerationTask(task: GenerationTaskEntity)
+
+  @Query(
+    """
+    UPDATE generation_tasks
+    SET status = :status,
+        updatedAtMs = :updatedAtMs,
+        errorMessage = :errorMessage
+    WHERE bookId = :bookId
+    """
+  )
+  suspend fun updateGenerationTaskStatus(
+    bookId: String,
+    status: String,
+    updatedAtMs: Long,
+    errorMessage: String? = null,
+  )
+
+  @Query(
+    """
+    UPDATE generation_tasks
+    SET status = :status,
+        currentChapterIndex = :currentChapterIndex,
+        currentChunkIndex = :currentChunkIndex,
+        completedChunks = :completedChunks,
+        totalChunks = :totalChunks,
+        updatedAtMs = :updatedAtMs,
+        lastValidProgressAtMs = :lastValidProgressAtMs,
+        errorMessage = NULL
+    WHERE bookId = :bookId
+    """
+  )
+  suspend fun updateGenerationTaskProgress(
+    bookId: String,
+    status: String,
+    currentChapterIndex: Int,
+    currentChunkIndex: Int,
+    completedChunks: Int,
+    totalChunks: Int,
+    updatedAtMs: Long,
+    lastValidProgressAtMs: Long,
+  )
+
+  @Query(
+    """
+    UPDATE generation_tasks
+    SET status = 'INTERRUPTED_BY_OS',
+        updatedAtMs = :updatedAtMs
+    WHERE status = 'RUNNING'
+    """
+  )
+  suspend fun markRunningTasksInterruptedByOs(updatedAtMs: Long)
+
+  @Query("DELETE FROM generation_tasks WHERE bookId = :bookId")
+  suspend fun deleteGenerationTask(bookId: String)
+
   @Transaction
   suspend fun clearBookGeneratedAudio(bookId: String) {
+    deleteGenerationTask(bookId)
     deleteChunksForBook(bookId)
     resetChaptersAudioState(bookId)
     updateBookPlaybackPosition(bookId, null, 0L)

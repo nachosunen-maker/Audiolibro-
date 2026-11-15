@@ -13,13 +13,57 @@ import java.io.File
  * ya que `sherpa-onnx` inserta BOS, padding `_` y EOS internamente en C++.
  */
 interface SpanishPhonemizer {
-  fun initialize(dataRootDir: String)
+  fun initialize(dataDirOrRoot: String)
 
   fun phonemizeToCodepoints(text: String, voice: String = DEFAULT_VOICE): List<IntArray>
 
   companion object {
     const val DEFAULT_VOICE = "es"
     const val MAX_CODEPOINTS_PER_SENTENCE = 400
+  }
+}
+
+data class NativePhonemizedSentence(
+  val codepoints: IntArray,
+  val previewIpa: String = "",
+)
+
+/**
+ * Puente mínimo sobre `piper-phonemize` v1.5.9 que encapsula la carga de `libpiper-phonemize-jni.so`,
+ * inicialización de `espeak-ng-data` y liberación determinista (`close()`) de `PiperPhonemizeResult`.
+ */
+interface NativePhonemizeBridge {
+  fun getVersion(): String
+
+  fun initialize(espeakDataDir: String): Int
+
+  fun phonemize(text: String, voice: String): List<NativePhonemizedSentence>?
+}
+
+object DefaultNativePhonemizeBridge : NativePhonemizeBridge {
+  override fun getVersion(): String = PiperPhonemize.nativeGetVersionStr()
+
+  override fun initialize(espeakDataDir: String): Int =
+    piperPhonemizeInitialize(dataDir = espeakDataDir)
+
+  override fun phonemize(text: String, voice: String): List<NativePhonemizedSentence>? {
+    val result = piperPhonemizeText(text = text, voice = voice) ?: return null
+    return try {
+      val sentenceCount = result.numSentences
+      val sentences = ArrayList<NativePhonemizedSentence>(sentenceCount.coerceAtLeast(0))
+      for (i in 0 until sentenceCount) {
+        val cps = result.getPhonemes(i)
+        val preview =
+          if (i == 0) runCatching { result.getPhonemesAsString(i).take(120) }.getOrDefault("")
+          else ""
+        sentences += NativePhonemizedSentence(codepoints = cps, previewIpa = preview)
+      }
+      sentences
+    } finally {
+      runCatching { result.close() }.onFailure { err ->
+        Log.w("PiperNativePhonemizer", "Error liberando PiperPhonemizeResult nativo", err)
+      }
+    }
   }
 }
 
@@ -47,7 +91,7 @@ object PhonemeSentenceBatcher {
         if (tail.isNotEmpty()) batches += tail
         break
       }
-      var splitAt = start + maxCodepoints
+      val splitAt = start + maxCodepoints
       var spaceIdx = -1
       for (idx in splitAt downTo (start + maxCodepoints / 2)) {
         if (codepoints[idx] == SPACE_CODEPOINT) {
@@ -84,59 +128,68 @@ object PhonemeSentenceBatcher {
 /**
  * Implementación nativa real basada en `com.github.csukuangfj.piper.phonemize` (v1.5.9)
  * y los datos binarios reales de eSpeak NG (`espeak-ng-data`).
+ *
+ * Contrato C++ verificado en `libpiper-phonemize-jni.so` y `PiperPhonemizeKt`:
+ * `piperPhonemizeInitialize(dataDir)` pasa `dataDir` directamente a `espeak_Initialize()`,
+ * que busca `<dataDir>/phontab`, `<dataDir>/phonindex`, `<dataDir>/phondata`, `<dataDir>/intonations`
+ * y `<dataDir>/es_dict`. Por tanto, `dataDir` debe apuntar al directorio `.../espeak-ng-data`,
+ * nunca a su carpeta padre.
  */
-class PiperNativePhonemizer : SpanishPhonemizer {
+class PiperNativePhonemizer(
+  private val bridge: NativePhonemizeBridge = DefaultNativePhonemizeBridge,
+) : SpanishPhonemizer {
 
-  @Volatile private var initializedRootDir: String? = null
+  private val initLock = Any()
+  @Volatile private var initializedEspeakDir: String? = null
 
-  override fun initialize(dataRootDir: String) {
-    val rootDir = File(dataRootDir)
-    val espeakDir = File(rootDir, "espeak-ng-data")
-    val esDict = File(espeakDir, "es_dict")
-    val phontab = File(espeakDir, "phontab")
-    check(espeakDir.isDirectory && esDict.isFile && phontab.isFile) {
-      "Directorio eSpeak NG inválido o incompleto en ${espeakDir.absolutePath} " +
-        "(esDict=${esDict.exists()}, phontab=${phontab.exists()})."
-    }
+  internal fun currentInitializedPath(): String? = initializedEspeakDir
 
-    if (initializedRootDir == rootDir.absolutePath) return
+  override fun initialize(dataDirOrRoot: String) {
+    val espeakDir = resolveAndValidateEspeakDataDir(dataDirOrRoot)
+    val resolvedPath = espeakDir.absolutePath
 
-    val version =
-      try {
-        PiperPhonemize.nativeGetVersionStr()
-      } catch (t: Throwable) {
-        Log.e(TAG, "Error cargando libpiper-phonemize-jni.so (verificando versión nativa)", t)
-        throw IllegalStateException(
-          "No se pudo cargar la librería nativa de fonemización (libpiper-phonemize-jni.so): " +
-            "${t.javaClass.simpleName}: ${t.message}",
-          t,
-        )
-      }
+    if (initializedEspeakDir == resolvedPath) return
 
-    // espeak_Initialize dentro de std::call_once devuelve la frecuencia (22050 > 0) la 1.ª vez,
-    // 0 en invocaciones posteriores ya inicializadas, y -1 en caso de error fatal.
-    val rc =
-      try {
-        piperPhonemizeInitialize(rootDir.absolutePath)
-      } catch (t: Throwable) {
-        Log.e(TAG, "Fallo en piperPhonemizeInitialize(${rootDir.absolutePath})", t)
-        throw IllegalStateException(
-          "Fallo nativo inicializando eSpeak NG (piper-phonemize $version): ${t.message}",
-          t,
-        )
-      }
+    synchronized(initLock) {
+      if (initializedEspeakDir == resolvedPath) return
 
-    Log.i(
-      TAG,
-      "piperPhonemizeInitialize(dataRoot=${rootDir.absolutePath}, version=$version) -> rc=$rc",
-    )
+      val version =
+        try {
+          bridge.getVersion()
+        } catch (t: Throwable) {
+          Log.e(TAG, "Error cargando libpiper-phonemize-jni.so (verificando versión nativa)", t)
+          throw IllegalStateException(
+            "No se pudo cargar la librería nativa de fonemización (libpiper-phonemize-jni.so): " +
+              "${t.javaClass.simpleName}: ${t.message}",
+            t,
+          )
+        }
 
-    if (rc < 0) {
-      throw IllegalStateException(
-        "eSpeak NG / piper-phonemize devolvió error ($rc) al cargar datos desde ${espeakDir.absolutePath}."
+      // espeak_Initialize dentro de std::call_once en C++ devuelve la frecuencia (22050 > 0) la 1.ª vez,
+      // 0 si ya se inicializó en este proceso, y -1 en caso de error fatal al abrir phontab/es_dict.
+      val rc =
+        try {
+          bridge.initialize(resolvedPath)
+        } catch (t: Throwable) {
+          Log.e(TAG, "Fallo en piperPhonemizeInitialize(espeakDir=$resolvedPath)", t)
+          throw IllegalStateException(
+            "Fallo nativo inicializando eSpeak NG (piper-phonemize $version) en $resolvedPath: ${t.message}",
+            t,
+          )
+        }
+
+      Log.i(
+        TAG,
+        "piperPhonemizeInitialize(espeakDataDir=$resolvedPath, version=$version) -> rc=$rc",
       )
+
+      if (rc < 0) {
+        throw IllegalStateException(
+          "eSpeak NG / piper-phonemize devolvió error ($rc) al cargar datos desde $resolvedPath."
+        )
+      }
+      initializedEspeakDir = resolvedPath
     }
-    initializedRootDir = rootDir.absolutePath
   }
 
   override fun phonemizeToCodepoints(text: String, voice: String): List<IntArray> {
@@ -145,13 +198,13 @@ class PiperNativePhonemizer : SpanishPhonemizer {
       throw IllegalArgumentException("No se puede fonemizar un fragmento vacío.")
     }
     val effectiveVoice = voice.ifBlank { SpanishPhonemizer.DEFAULT_VOICE }
-    check(initializedRootDir != null) {
+    check(initializedEspeakDir != null) {
       "PiperNativePhonemizer no está inicializado antes de phonemizeToCodepoints()."
     }
 
-    val result =
+    val rawSentences =
       try {
-        piperPhonemizeText(text = clean, voice = effectiveVoice)
+        bridge.phonemize(text = clean, voice = effectiveVoice)
       } catch (t: Throwable) {
         Log.e(TAG, "Fallo nativo en piperPhonemizeText(voice=$effectiveVoice, len=${clean.length})", t)
         throw IllegalStateException(
@@ -163,49 +216,68 @@ class PiperNativePhonemizer : SpanishPhonemizer {
           "piperPhonemizeText devolvió null para el texto proporcionado (voz=$effectiveVoice, len=${clean.length})."
         )
 
-    try {
-      val sentenceCount = result.numSentences
-      if (sentenceCount <= 0) {
-        throw IllegalStateException(
-          "piper-phonemize devolvió 0 oraciones fonéticas para un texto de ${clean.length} caracteres."
-        )
-      }
-
-      val sentences = ArrayList<IntArray>(sentenceCount)
-      var totalPhonemes = 0
-      var firstSentencePreview = ""
-      for (i in 0 until sentenceCount) {
-        val cps = result.getPhonemes(i)
-        if (cps.isNotEmpty()) {
-          if (sentences.isEmpty()) {
-            firstSentencePreview = runCatching { result.getPhonemesAsString(i).take(120) }.getOrDefault("")
-          }
-          totalPhonemes += cps.size
-          sentences += cps
-        }
-      }
-
-      val sanitized = PhonemeSentenceBatcher.sanitizeCodepoints(sentences)
-      if (sanitized.isEmpty() || totalPhonemes == 0) {
-        throw IllegalStateException(
-          "piper-phonemize no produjo codepoints IPA válidos (oraciones=$sentenceCount, total=$totalPhonemes)."
-        )
-      }
-
-      Log.d(
-        TAG,
-        "eSpeak NG (voz=$effectiveVoice): ${clean.length} chars -> $sentenceCount oraciones " +
-          "(${sanitized.size} lotes), $totalPhonemes fonemas. Muestra IPA[0]: \"$firstSentencePreview\"",
+    if (rawSentences.isEmpty()) {
+      throw IllegalStateException(
+        "piper-phonemize devolvió 0 oraciones fonéticas para un texto de ${clean.length} caracteres."
       )
-      return sanitized
-    } finally {
-      runCatching { result.close() }.onFailure { err ->
-        Log.w(TAG, "Error liberando PiperPhonemizeResult nativo", err)
+    }
+
+    val sentences = ArrayList<IntArray>(rawSentences.size)
+    var totalPhonemes = 0
+    var firstSentencePreview = ""
+    for (entry in rawSentences) {
+      if (entry.codepoints.isNotEmpty()) {
+        if (sentences.isEmpty()) {
+          firstSentencePreview = entry.previewIpa
+        }
+        totalPhonemes += entry.codepoints.size
+        sentences += entry.codepoints
       }
     }
+
+    val sanitized = PhonemeSentenceBatcher.sanitizeCodepoints(sentences)
+    if (sanitized.isEmpty() || totalPhonemes == 0) {
+      throw IllegalStateException(
+        "piper-phonemize no produjo codepoints IPA válidos (oraciones=${rawSentences.size}, total=$totalPhonemes)."
+      )
+    }
+
+    Log.d(
+      TAG,
+      "eSpeak NG (voz=$effectiveVoice): ${clean.length} chars -> ${rawSentences.size} oraciones " +
+        "(${sanitized.size} lotes), $totalPhonemes fonemas. Muestra IPA[0]: \"$firstSentencePreview\"",
+    )
+    return sanitized
   }
 
   companion object {
     private const val TAG = "PiperNativePhonemizer"
+    val REQUIRED_ESPEAK_FILES =
+      listOf("es_dict", "phontab", "phonindex", "phondata", "intonations")
+
+    fun resolveAndValidateEspeakDataDir(dataDirOrRoot: String): File {
+      val candidate = File(dataDirOrRoot)
+      val directHasTables =
+        File(candidate, "phontab").isFile && File(candidate, "es_dict").isFile
+      val nested = File(candidate, "espeak-ng-data")
+      val espeakDir =
+        when {
+          directHasTables -> candidate
+          nested.isDirectory -> nested
+          else -> candidate
+        }
+
+      val missing =
+        REQUIRED_ESPEAK_FILES.filter { name ->
+          val f = File(espeakDir, name)
+          !f.isFile || f.length() <= 0L
+        }
+
+      check(espeakDir.isDirectory && missing.isEmpty()) {
+        "Directorio eSpeak NG inválido o incompleto en ${espeakDir.absolutePath} " +
+          "(archivos faltantes o vacíos: ${missing.joinToString()})."
+      }
+      return espeakDir
+    }
   }
 }

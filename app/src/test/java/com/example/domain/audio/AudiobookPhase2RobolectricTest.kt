@@ -821,7 +821,7 @@ class AudiobookPhase2RobolectricTest {
     }
 
   @Test
-  fun `AudiobookGenerationService declares dataSync permission creates channel and handles start cancel safely`() {
+  fun `AudiobookGenerationService declares mediaProcessing and specialUse permissions creates channel and handles start cancel safely`() {
     val pkgInfo =
       context.packageManager.getPackageInfo(
         context.packageName,
@@ -829,7 +829,23 @@ class AudiobookPhase2RobolectricTest {
           android.content.pm.PackageManager.GET_SERVICES,
       )
     val permissions = pkgInfo.requestedPermissions?.toSet().orEmpty()
-    assertTrue(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_DATA_SYNC))
+    assertTrue(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING))
+    assertTrue(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE))
+    assertFalse(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_DATA_SYNC))
+    assertFalse(permissions.contains(android.Manifest.permission.INTERNET))
+    assertEquals(0, AudiobookGenerationService.foregroundServiceTypeForSdk(33))
+    assertEquals(
+      android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
+      AudiobookGenerationService.foregroundServiceTypeForSdk(34),
+    )
+    assertEquals(
+      android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING,
+      AudiobookGenerationService.foregroundServiceTypeForSdk(35),
+    )
+    assertEquals(
+      android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING,
+      AudiobookGenerationService.foregroundServiceTypeForSdk(36),
+    )
     val serviceInfo =
       pkgInfo.services?.firstOrNull {
         it.name == AudiobookGenerationService::class.java.name

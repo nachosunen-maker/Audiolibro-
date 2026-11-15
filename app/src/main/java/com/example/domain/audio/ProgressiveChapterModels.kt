@@ -37,11 +37,14 @@ data class ProgressiveChapterState(
   val isCompleteChapterReady: Boolean = false,
   val statusMessage: String = "",
   val errorMessage: String? = null,
+  val totalChapterChars: Int = 0,
+  val synthesizedChapterChars: Int = 0,
 ) {
   val overallChapterProgressFraction: Float
     get() =
       when {
         isCompleteChapterReady || phase == ProgressiveChapterPhase.COMPLETED -> 1f
+        totalChapterChars > 0 -> (synthesizedChapterChars.toFloat() / totalChapterChars.toFloat()).coerceIn(0f, 1f)
         totalChunks > 0 -> (chunksCompleted.toFloat() / totalChunks.toFloat()).coerceIn(0f, 1f)
         else -> 0f
       }

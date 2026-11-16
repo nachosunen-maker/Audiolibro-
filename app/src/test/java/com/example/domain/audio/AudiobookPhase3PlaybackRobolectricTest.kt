@@ -79,6 +79,7 @@ class AudiobookPhase3PlaybackRobolectricTest {
 
   @After
   fun tearDown() {
+    runBlocking { repository.awaitAndCloseForTesting() }
     storageManager.deleteBookAudioFiles("book-p3-1")
     storageManager.deleteBookAudioFiles("book-p3-2")
     File(context.filesDir, "covers").deleteRecursively()

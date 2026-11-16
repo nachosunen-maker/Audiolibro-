@@ -51,6 +51,10 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
   private lateinit var context: Context
   private lateinit var db: AppDatabase
   private lateinit var storageManager: AudiobookStorageManager
+  private val trackedRepos = mutableListOf<AudiobookRepository>()
+
+  private fun trackRepo(repo: AudiobookRepository): AudiobookRepository =
+    repo.also { trackedRepos += it }
 
   @Before
   fun setUp() {
@@ -65,6 +69,10 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
 
   @After
   fun tearDown() {
+    runBlocking {
+      trackedRepos.forEach { it.awaitAndCloseForTesting() }
+      trackedRepos.clear()
+    }
     storageManager.deleteBookAudioFiles("rec-book-1")
     storageManager.deleteBookAudioFiles("rec-book-2")
     storageManager.deleteBookAudioFiles("svc-book-1")
@@ -464,6 +472,7 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
         restartedDao.getChaptersOnce("rec-book-2").single().audioStatus,
       )
 
+      restartedRepo.awaitAndCloseForTesting()
       restartedDb.close()
       dbFile.delete()
     }
@@ -531,11 +540,13 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
         }
 
       val repo =
-        AudiobookRepository(
-          context = context,
-          dao = dao,
-          storageManager = storageManager,
-          audioSynthesisProvider = blockingProvider,
+        trackRepo(
+          AudiobookRepository(
+            context = context,
+            dao = dao,
+            storageManager = storageManager,
+            audioSynthesisProvider = blockingProvider,
+          )
         )
 
       val serviceController = Robolectric.buildService(AudiobookGenerationService::class.java)
@@ -585,6 +596,8 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
       )
 
       serviceController.destroy()
+      service.awaitJobsForTesting()
+      repo.awaitAndCloseForTesting()
     }
 
   @Test
@@ -655,11 +668,13 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
       }
 
     val repo =
-      AudiobookRepository(
-        context = context,
-        dao = dao,
-        storageManager = storageManager,
-        audioSynthesisProvider = okProvider,
+      trackRepo(
+        AudiobookRepository(
+          context = context,
+          dao = dao,
+          storageManager = storageManager,
+          audioSynthesisProvider = okProvider,
+        )
       )
 
     // Ejecutar directamente la lógica del Worker con la BD real de prueba
@@ -751,11 +766,13 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
         }
 
       val repo =
-        AudiobookRepository(
-          context = context,
-          dao = dao,
-          storageManager = storageManager,
-          audioSynthesisProvider = slowProvider,
+        trackRepo(
+          AudiobookRepository(
+            context = context,
+            dao = dao,
+            storageManager = storageManager,
+            audioSynthesisProvider = slowProvider,
+          )
         )
 
       val serviceController = Robolectric.buildService(AudiobookGenerationService::class.java)
@@ -788,14 +805,12 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
       org.robolectric.shadows.ShadowLooper.idleMainLooper()
       assertFalse(service.isWakeLockHeldForTesting())
 
-      var pausedStatus: String? = null
-      for (i in 1..40) {
-        pausedStatus = dao.getGenerationTaskOnce("svc-book-1")?.status
-        if (pausedStatus == GenerationTaskStatus.PAUSED_BY_USER.name) break
-        delay(25L)
-      }
+      repo.awaitPersistenceForTesting()
+      val pausedStatus = dao.getGenerationTaskOnce("svc-book-1")?.status
       assertEquals(GenerationTaskStatus.PAUSED_BY_USER.name, pausedStatus)
 
       serviceController.destroy()
+      service.awaitJobsForTesting()
+      repo.awaitAndCloseForTesting()
     }
 }

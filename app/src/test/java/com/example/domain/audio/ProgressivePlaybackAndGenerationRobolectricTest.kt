@@ -69,6 +69,10 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
   private lateinit var context: Context
   private lateinit var db: AppDatabase
   private lateinit var storageManager: AudiobookStorageManager
+  private val trackedRepos = mutableListOf<AudiobookRepository>()
+
+  private fun trackRepo(repo: AudiobookRepository): AudiobookRepository =
+    repo.also { trackedRepos += it }
 
   @Before
   fun setUp() {
@@ -81,6 +85,10 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
 
   @After
   fun tearDown() {
+    runBlocking {
+      trackedRepos.forEach { it.awaitAndCloseForTesting() }
+      trackedRepos.clear()
+    }
     storageManager.deleteBookAudioFiles("prog-book-1")
     storageManager.deleteBookAudioFiles("prog-book-err")
     db.close()
@@ -170,11 +178,13 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
         }
 
       val repo =
-        AudiobookRepository(
-          context = context,
-          dao = dao,
-          storageManager = storageManager,
-          audioSynthesisProvider = provider,
+        trackRepo(
+          AudiobookRepository(
+            context = context,
+            dao = dao,
+            storageManager = storageManager,
+            audioSynthesisProvider = provider,
+          )
         )
       val testPlayer = InMemoryPlaylistPlayer()
       val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
@@ -317,7 +327,7 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
           }
         }
 
-      val repo = AudiobookRepository(context, dao, storageManager = storageManager, audioSynthesisProvider = slowProvider)
+      val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager, audioSynthesisProvider = slowProvider))
       repo.startProgressiveChapterLoading("prog-book-1", chapterIndex = 1)
       awaitCondition { synthCount >= 1 }
       repo.pauseProgressiveGeneration(userPaused = true)
@@ -411,7 +421,7 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
           }
         }
 
-      val repo = AudiobookRepository(context, dao, storageManager = storageManager, audioSynthesisProvider = provider)
+      val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager, audioSynthesisProvider = provider))
       repo.startProgressiveChapterLoading("prog-book-err", chapterIndex = 1)
       awaitCondition {
         repo.progressiveChapterState.value?.phase == ProgressiveChapterPhase.RECOVERABLE_ERROR
@@ -524,7 +534,7 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
         },
       )
 
-      val repo = AudiobookRepository(context, dao, storageManager = storageManager)
+      val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
       val testPlayer = InMemoryPlaylistPlayer()
       val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
       val detailVm = BookDetailViewModel("prog-book-1", repo, controller)

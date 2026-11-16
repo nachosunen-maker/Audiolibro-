@@ -37,6 +37,7 @@ import com.google.common.util.concurrent.ListenableFuture
 import java.io.File
 import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.test.runTest
 import org.junit.After
 import org.junit.Assert.assertEquals
@@ -61,6 +62,10 @@ class AudiobookPhase2RobolectricTest {
   private lateinit var context: Context
   private lateinit var db: AppDatabase
   private lateinit var storageManager: AudiobookStorageManager
+  private val trackedRepos = mutableListOf<AudiobookRepository>()
+
+  private fun trackRepo(repo: AudiobookRepository): AudiobookRepository =
+    repo.also { trackedRepos += it }
 
   @Before
   fun setUp() {
@@ -73,6 +78,10 @@ class AudiobookPhase2RobolectricTest {
 
   @After
   fun tearDown() {
+    runBlocking {
+      trackedRepos.forEach { it.awaitAndCloseForTesting() }
+      trackedRepos.clear()
+    }
     storageManager.deleteBookAudioFiles("book-1")
     storageManager.deleteBookAudioFiles("book-2")
     db.close()
@@ -92,7 +101,7 @@ class AudiobookPhase2RobolectricTest {
       val dao = db.audiobookDao()
       insertSampleBook(dao, "book-1", NarratorVoice.FEMALE)
 
-      val defaultRepo = AudiobookRepository(context, dao, storageManager = storageManager)
+      val defaultRepo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
       assertTrue(defaultRepo.audioSynthesisProvider is PiperAudioSynthesisProvider)
       assertEquals("es_ES-sharvard-medium", defaultRepo.audioSynthesisProvider.modelId)
       assertTrue(defaultRepo.audioSynthesisProvider.isConfigured)
@@ -376,7 +385,7 @@ class AudiobookPhase2RobolectricTest {
     )
 
     val testPlayer = InMemoryPlaylistPlayer()
-    val repo = AudiobookRepository(context, dao, storageManager = storageManager)
+    val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
     val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
     val book = dao.getBookOnce("book-1")!!.toDomain()
     val chapters = dao.getChaptersOnce("book-1").map { it.toDomain() }
@@ -424,7 +433,7 @@ class AudiobookPhase2RobolectricTest {
   fun `BookDetailScreen renders Spanish generation controls and switches voice cleanly`() = runTest {
     val dao = db.audiobookDao()
     insertSampleBook(dao, "book-1", NarratorVoice.FEMALE)
-    val repo = AudiobookRepository(context, dao, storageManager = storageManager)
+    val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
     val testPlayer = InMemoryPlaylistPlayer()
     val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
     val vm = BookDetailViewModel("book-1", repo, controller)
@@ -615,6 +624,7 @@ class AudiobookPhase2RobolectricTest {
         generationError = null,
       )
       firstRepo.updatePlaybackPosition(importedBook.id, chapter.chapterIndex, 320L)
+      firstRepo.awaitAndCloseForTesting()
       firstDb.close()
 
       // Simulate app restart with fresh AppDatabase + Repository
@@ -635,6 +645,7 @@ class AudiobookPhase2RobolectricTest {
       assertTrue(WavAudioCodec.isValidWavFile(File(reopenedChapter.audioFilePath!!)))
       assertTrue(reopenedRepo.getBookAudioStorageBytes(importedBook.id) > 0L)
 
+      reopenedRepo.awaitAndCloseForTesting()
       reopenedDb.close()
       storageManager.deleteBookAudioFiles(importedBook.id)
       dbFile.delete()
@@ -773,7 +784,7 @@ class AudiobookPhase2RobolectricTest {
   @Test
   fun `generation exception during initial prep sets isRunning false and stores error message`() = runTest {
     val dao = db.audiobookDao()
-    val repo = AudiobookRepository(context, dao)
+    val repo = trackRepo(AudiobookRepository(context, dao))
     repo.startAudiobookGeneration("non-existent-book-id")
     val progress = repo.generationProgress.map { it["non-existent-book-id"] }.first { it != null && !it.isRunning }
     assertNotNull(progress)
@@ -786,7 +797,7 @@ class AudiobookPhase2RobolectricTest {
     runTest {
       val dao = db.audiobookDao()
       insertSampleBook(dao, "book-1", NarratorVoice.FEMALE)
-      val repo = AudiobookRepository(context, dao, storageManager = storageManager)
+      val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
       val testPlayer = InMemoryPlaylistPlayer()
       val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
       val vm = BookDetailViewModel("book-1", repo, controller)
@@ -853,7 +864,7 @@ class AudiobookPhase2RobolectricTest {
     assertNotNull(serviceInfo)
 
     val dao = db.audiobookDao()
-    val repo = AudiobookRepository(context, dao, storageManager = storageManager)
+    val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
     val controller = Robolectric.buildService(AudiobookGenerationService::class.java)
     val service = controller.create().get()
     service.repositoryOverride = repo
@@ -869,6 +880,10 @@ class AudiobookPhase2RobolectricTest {
       context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
     assertNotNull(nm.getNotificationChannel(AudiobookGenerationService.CHANNEL_ID_GENERATION))
     controller.destroy()
+    runBlocking {
+      service.awaitJobsForTesting()
+      repo.awaitAndCloseForTesting()
+    }
   }
 
   @Test
@@ -992,7 +1007,7 @@ class AudiobookPhase2RobolectricTest {
         ),
       )
 
-      val repo = AudiobookRepository(context, dao, storageManager = storageManager)
+      val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
       val testPlayer = InMemoryPlaylistPlayer()
       val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
       val vm = BookDetailViewModel("book-interrupted", repo, controller)

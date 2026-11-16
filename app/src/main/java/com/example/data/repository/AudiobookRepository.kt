@@ -88,9 +88,11 @@ class AudiobookRepository(
         )
       }
     }
+  private val generationParentJob = SupervisorJob()
   private val generationScope =
-    CoroutineScope(SupervisorJob() + Dispatchers.IO + generationExceptionHandler)
-  private val taskPersistenceScope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
+    CoroutineScope(generationParentJob + Dispatchers.IO + generationExceptionHandler)
+  private val taskPersistenceParentJob = SupervisorJob()
+  private val taskPersistenceScope = CoroutineScope(taskPersistenceParentJob + Dispatchers.IO)
   private val taskDbMutex = Mutex()
   private val queueLock = Any()
   private val pendingBookIds = ArrayDeque<String>()
@@ -1002,22 +1004,23 @@ class AudiobookRepository(
         if (activeBookId == bookId) activeJob else null
       }
 
-    // Persistir PAUSED_BY_USER antes de cancelar la corrutina para que la cola persistente
-    // distinga la pausa explícita del usuario frente a una muerte del proceso por el SO.
-    taskPersistenceScope.launch {
-      taskDbMutex.withLock {
-        val existing = dao.getGenerationTaskOnce(bookId)
-        if (existing != null) {
-          dao.updateGenerationTaskStatus(
-            bookId = bookId,
-            status = GenerationTaskStatus.PAUSED_BY_USER.name,
-            updatedAtMs = System.currentTimeMillis(),
-            errorMessage = null,
-          )
-        }
-      }
+    // Persistir PAUSED_BY_USER antes de cancelar la corrutina y sin dejar operaciones Room
+    // asíncronas huérfanas para que la cola persistente distinga la pausa explícita del usuario.
+    runBlocking(Dispatchers.IO) {
+      awaitPersistenceJobs()
       val anyOtherRecoverable =
-        taskDbMutex.withLock { dao.getRecoverableGenerationTasksOnce().isNotEmpty() }
+        taskDbMutex.withLock {
+          val existing = dao.getGenerationTaskOnce(bookId)
+          if (existing != null) {
+            dao.updateGenerationTaskStatus(
+              bookId = bookId,
+              status = GenerationTaskStatus.PAUSED_BY_USER.name,
+              updatedAtMs = System.currentTimeMillis(),
+              errorMessage = null,
+            )
+          }
+          dao.getRecoverableGenerationTasksOnce().isNotEmpty()
+        }
       if (!anyOtherRecoverable) {
         AudiobookRecoveryScheduler.cancelRecovery(context.applicationContext)
       }
@@ -1049,7 +1052,8 @@ class AudiobookRepository(
         Pair((ids + listOfNotNull(runningId)).distinct(), activeJob)
       }
 
-    taskPersistenceScope.launch {
+    runBlocking(Dispatchers.IO) {
+      awaitPersistenceJobs()
       val now = System.currentTimeMillis()
       taskDbMutex.withLock {
         for (id in active.first) {
@@ -1135,6 +1139,33 @@ class AudiobookRepository(
         )
       }
     }
+  }
+
+  private suspend fun awaitPersistenceJobs() {
+    while (true) {
+      val children = taskPersistenceParentJob.children.toList()
+      if (children.isEmpty()) break
+      children.forEach { it.join() }
+    }
+  }
+
+  internal suspend fun awaitPersistenceForTesting() {
+    awaitPersistenceJobs()
+  }
+
+  internal suspend fun awaitAndCloseForTesting() {
+    stopProgressiveGenerationForBook(bookId = null, reasonPauseOnly = false)
+    awaitPersistenceJobs()
+    while (true) {
+      val genChildren = generationParentJob.children.toList()
+      if (genChildren.isEmpty()) break
+      genChildren.forEach { it.cancel() }
+      genChildren.forEach { it.join() }
+    }
+    awaitPersistenceJobs()
+    generationParentJob.cancel()
+    taskPersistenceParentJob.cancel()
+    release()
   }
 
   fun release() {

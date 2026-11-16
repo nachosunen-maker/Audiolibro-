@@ -45,7 +45,8 @@ class AudiobookGenerationService : Service() {
     repositoryOverride ?: AudiobookRepository.getInstance(applicationContext)
   }
 
-  private val serviceScope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private val serviceParentJob = SupervisorJob()
+  private val serviceScope = CoroutineScope(serviceParentJob + Dispatchers.Main.immediate)
   private var observerJob: Job? = null
   private var stickyRestoreJob: Job? = null
   private var wakeLockRenewalJob: Job? = null
@@ -155,6 +156,14 @@ class AudiobookGenerationService : Service() {
   }
 
   internal fun isWakeLockHeldForTesting(): Boolean = wakeLock?.isHeld == true
+
+  internal suspend fun awaitJobsForTesting() {
+    while (true) {
+      val children = serviceParentJob.children.toList()
+      if (children.isEmpty()) break
+      children.forEach { it.join() }
+    }
+  }
 
   private fun stopServiceCleanly(targetStartId: Int = activeStartId) {
     stopWakeLockAndRenewal()

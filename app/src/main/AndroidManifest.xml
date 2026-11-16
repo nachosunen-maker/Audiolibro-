@@ -4,8 +4,6 @@
 
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING" />
-    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_SPECIAL_USE" />
     <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
     <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
 
@@ -32,14 +30,7 @@
             </intent-filter>
         </activity>
 
-        <service
-            android:name=".domain.audio.AudiobookGenerationService"
-            android:exported="false"
-            android:foregroundServiceType="mediaProcessing|specialUse">
-            <property
-                android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
-                android:value="Local offline Piper VITS neural text-to-speech WAV synthesis on Android 14 prior to mediaProcessing in Android 15." />
-        </service>
+
 
         <service
             android:name=".player.AudiobookPlaybackService"

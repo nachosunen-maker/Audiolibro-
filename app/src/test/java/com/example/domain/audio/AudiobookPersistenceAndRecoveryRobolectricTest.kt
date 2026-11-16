@@ -252,7 +252,7 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
   }
 
   @Test
-  fun `G_persistent_db_queue_recovers_after_process_restart_without_duplicating_chunks_or_resuming_user_paused_books`() =
+  fun `C_progressive_chapter_recovery_resumes_from_valid_disk_chunks_without_duplicating_or_preconverting_next_chapter`() =
     runTest {
       val dbFile = File(context.cacheDir, "recovery_restart_test.db")
       dbFile.delete()
@@ -264,11 +264,9 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
       val expectedChunks = ChapterTextChunker.splitChapter(longText)
       assertTrue(expectedChunks.size >= 2)
 
-      // 1. Primera instancia (antes del kill del proceso): Libro 1 con fragmento 0 ya guardado válido en disco
-      // y tarea marcada RUNNING; Libro 2 marcado PAUSED_BY_USER.
       val firstDb =
         Room.databaseBuilder(context, AppDatabase::class.java, dbFile.absolutePath)
-          .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3)
+          .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4)
           .allowMainThreadQueries()
           .build()
       val firstDao = firstDb.audiobookDao()
@@ -340,76 +338,15 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
           )
         }
       )
-      firstDao.upsertGenerationTask(
-        GenerationTaskEntity(
-          bookId = "rec-book-1",
-          queueOrder = 10L,
-          voiceName = NarratorVoice.MALE.name,
-          status = GenerationTaskStatus.RUNNING.name,
-          currentChapterIndex = 1,
-          currentChunkIndex = 1,
-          completedChunks = 1,
-          totalChunks = expectedChunks.size + 1,
-          startedAtMs = 100L,
-          updatedAtMs = 200L,
-          lastValidProgressAtMs = 200L,
-        )
-      )
-
-      // Libro 2: pausado explícitamente por el usuario -> NO debe reanudarse solo
-      firstDao.insertBookWithChapters(
-        BookEntity(
-          id = "rec-book-2",
-          title = "Libro Pausado Usuario",
-          author = "Autor",
-          language = "es",
-          publisher = "",
-          description = "",
-          coverImagePath = null,
-          sourceFileName = "rec2.epub",
-          selectedVoice = NarratorVoice.FEMALE.name,
-          totalChapters = 1,
-          totalWords = 5,
-          totalCharacters = 30,
-          estimatedMinutes = 1,
-          importedAt = 101L,
-        ),
-        listOf(
-          ChapterEntity(
-            id = "rec-book-2_ch_1",
-            bookId = "rec-book-2",
-            chapterIndex = 1,
-            title = "Cap 1",
-            contentText = "Este libro fue pausado manualmente.",
-            wordCount = 5,
-            characterCount = 34,
-            estimatedMinutes = 1,
-            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
-            audioFilePath = null,
-          )
-        ),
-      )
-      firstDao.upsertGenerationTask(
-        GenerationTaskEntity(
-          bookId = "rec-book-2",
-          queueOrder = 20L,
-          voiceName = NarratorVoice.FEMALE.name,
-          status = GenerationTaskStatus.PAUSED_BY_USER.name,
-          startedAtMs = 150L,
-          updatedAtMs = 250L,
-        )
-      )
       firstDb.close()
 
-      // 2. Nuevo proceso simulado: nueva instancia de AppDatabase + nuevo AudiobookRepository
       val restartedDb =
         Room.databaseBuilder(context, AppDatabase::class.java, dbFile.absolutePath)
-          .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3)
+          .addMigrations(AppDatabase.MIGRATION_1_2, AppDatabase.MIGRATION_2_3, AppDatabase.MIGRATION_3_4)
           .allowMainThreadQueries()
           .build()
       val restartedDao = restartedDb.audiobookDao()
 
-      val synthesizedBookIds = mutableListOf<String>()
       val synthesizedChunkTexts = mutableListOf<String>()
       val trackingProvider =
         object : AudioSynthesisProvider {
@@ -424,7 +361,6 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
             chapterTitle: String,
           ): Result<SynthesizedAudioPayload> {
             synchronized(synthesizedChunkTexts) {
-              synthesizedBookIds += bookTitle
               synthesizedChunkTexts += text
             }
             return Result.success(
@@ -445,480 +381,23 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
           audioSynthesisProvider = trackingProvider,
         )
 
-      val didRestore = restartedRepo.restoreRecoverableGenerations(startServiceIfNeeded = false)
-      assertTrue(didRestore)
+      restartedRepo.startProgressiveChapterLoading("rec-book-1", chapterIndex = 1)
+      val finishedState =
+        restartedRepo.progressiveChapterState.first { state ->
+          state != null && state.bookId == "rec-book-1" && state.isCompleteChapterReady
+        }
+      assertNotNull(finishedState)
 
-      val finishedProgress =
-        restartedRepo.generationProgress
-          .first { map -> map["rec-book-1"]?.phase == GenerationPhase.COMPLETED }["rec-book-1"]
-      assertNotNull(finishedProgress)
-
-      // Verificar que NO duplicó el chunk 0 ya válido en disco y SÍ generó el resto + cap 2
+      // No duplicó el chunk 0 ya válido en disco y no preconvirtió el capítulo 2.
       assertFalse(synthesizedChunkTexts.contains(expectedChunks.first()))
-      assertEquals(expectedChunks.drop(1) + "Capítulo final completo.", synthesizedChunkTexts)
-      assertTrue(synthesizedBookIds.all { it == "Libro Recuperable" })
+      assertEquals(expectedChunks.drop(1), synthesizedChunkTexts)
 
-      val chsBook1 = restartedDao.getChaptersOnce("rec-book-1")
-      assertTrue(chsBook1.all { it.audioStatus == AudioGenerationStatus.READY.name })
-      assertEquals(GenerationTaskStatus.COMPLETED.name, restartedDao.getGenerationTaskOnce("rec-book-1")?.status)
-
-      // Libro 2 debe permanecer PAUSED_BY_USER sin haber sido tocado
-      assertEquals(
-        GenerationTaskStatus.PAUSED_BY_USER.name,
-        restartedDao.getGenerationTaskOnce("rec-book-2")?.status,
-      )
-      assertEquals(
-        AudioGenerationStatus.NOT_GENERATED.name,
-        restartedDao.getChaptersOnce("rec-book-2").single().audioStatus,
-      )
+      val chsBook1 = restartedDao.getChaptersOnce("rec-book-1").sortedBy { it.chapterIndex }
+      assertEquals(AudioGenerationStatus.READY.name, chsBook1[0].audioStatus)
+      assertEquals(AudioGenerationStatus.NOT_GENERATED.name, chsBook1[1].audioStatus)
 
       restartedRepo.awaitAndCloseForTesting()
       restartedDb.close()
       dbFile.delete()
     }
-
-  @Test
-  fun `F_service_onTimeout_saves_INTERRUPTED_BY_OS_releases_WakeLock_stops_cleanly_and_schedules_WorkManager`() =
-    runTest {
-      val dao = db.audiobookDao()
-      dao.insertBookWithChapters(
-        BookEntity(
-          id = "svc-book-1",
-          title = "Libro Largo Servicio",
-          author = "Autor",
-          language = "es",
-          publisher = "",
-          description = "",
-          coverImagePath = null,
-          sourceFileName = "svc.epub",
-          selectedVoice = NarratorVoice.FEMALE.name,
-          totalChapters = 1,
-          totalWords = 10,
-          totalCharacters = 60,
-          estimatedMinutes = 1,
-          importedAt = 100L,
-        ),
-        listOf(
-          ChapterEntity(
-            id = "svc-book-1_ch_1",
-            bookId = "svc-book-1",
-            chapterIndex = 1,
-            title = "Cap 1",
-            contentText = "Primera oración larga.\n\nSegunda oración larga.",
-            wordCount = 6,
-            characterCount = 46,
-            estimatedMinutes = 1,
-            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
-            audioFilePath = null,
-          )
-        ),
-      )
-
-      val startedFirstChunk = CountDownLatch(1)
-      val blockingProvider =
-        object : AudioSynthesisProvider {
-          override val isConfigured = true
-          override val providerName = "BlockingPiperTest"
-          override val modelId = "es_ES-sharvard-medium"
-
-          override suspend fun synthesizeFragment(
-            text: String,
-            voice: NarratorVoice,
-            bookTitle: String,
-            chapterTitle: String,
-          ): Result<SynthesizedAudioPayload> {
-            startedFirstChunk.countDown()
-            delay(60_000L)
-            return Result.success(
-              SynthesizedAudioPayload(
-                bytes = ByteArray(4410) { 1 },
-                mimeType = "audio/L16;rate=22050;channels=1",
-                sampleRate = 22_050,
-              )
-            )
-          }
-        }
-
-      val repo =
-        trackRepo(
-          AudiobookRepository(
-            context = context,
-            dao = dao,
-            storageManager = storageManager,
-            audioSynthesisProvider = blockingProvider,
-          )
-        )
-
-      val serviceController = Robolectric.buildService(AudiobookGenerationService::class.java)
-      val service = serviceController.create().get()
-      service.repositoryOverride = repo
-
-      val startIntent =
-        Intent(context, AudiobookGenerationService::class.java).apply {
-          action = AudiobookGenerationService.ACTION_START_GENERATION
-          putExtra(AudiobookGenerationService.EXTRA_BOOK_ID, "svc-book-1")
-        }
-      val stickyMode = service.onStartCommand(startIntent, 0, 1)
-      assertEquals(android.app.Service.START_STICKY, stickyMode)
-      assertTrue(service.isWakeLockHeldForTesting())
-
-      assertTrue("Synth coroutine should start", startedFirstChunk.await(5, TimeUnit.SECONDS))
-      // Asegurar que la fila RUNNING ya se escribió en Room antes del timeout
-      var runningTask: GenerationTaskEntity? = null
-      for (attempt in 1..40) {
-        runningTask = dao.getGenerationTaskOnce("svc-book-1")
-        if (runningTask?.status == GenerationTaskStatus.RUNNING.name) break
-        delay(25L)
-      }
-      assertEquals(GenerationTaskStatus.RUNNING.name, runningTask?.status)
-
-      // Simular callback de Android 15+: Service.onTimeout(startId, FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING)
-      service.onTimeout(1, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING)
-      repo.awaitPersistenceForTesting()
-
-      // 1. WakeLock liberado inmediatamente sin fuga
-      assertFalse(service.isWakeLockHeldForTesting())
-
-      // 2. Tarea queda en INTERRUPTED_BY_OS (NO PAUSED_BY_USER), lista para reanudarse sola
-      val postTimeoutTask = dao.getGenerationTaskOnce("svc-book-1")
-      assertNotNull(postTimeoutTask)
-      assertEquals(GenerationTaskStatus.INTERRUPTED_BY_OS.name, postTimeoutTask!!.status)
-
-      // 3. WorkManager recibió el trabajo único de recuperación persistente
-      val workInfos =
-        WorkManager.getInstance(context)
-          .getWorkInfosForUniqueWork(AudiobookRecoveryScheduler.UNIQUE_RECOVERY_WORK_NAME)
-          .get()
-      assertTrue(workInfos.isNotEmpty())
-      assertTrue(
-        workInfos.any {
-          it.state == WorkInfo.State.ENQUEUED || it.state == WorkInfo.State.RUNNING
-        }
-      )
-
-      serviceController.destroy()
-      service.awaitJobsForTesting()
-      repo.awaitAndCloseForTesting()
-    }
-
-  @Test
-  fun `H_recovery_worker_resumes_interrupted_db_tasks_and_exits_cleanly_when_empty`() = runTest {
-    val dao = db.audiobookDao()
-    dao.insertBookWithChapters(
-      BookEntity(
-        id = "rec-book-1",
-        title = "Worker Book",
-        author = "Autor",
-        language = "es",
-        publisher = "",
-        description = "",
-        coverImagePath = null,
-        sourceFileName = "w.epub",
-        selectedVoice = NarratorVoice.MALE.name,
-        totalChapters = 1,
-        totalWords = 5,
-        totalCharacters = 30,
-        estimatedMinutes = 1,
-        importedAt = 10L,
-      ),
-      listOf(
-        ChapterEntity(
-          id = "rec-book-1_ch_1",
-          bookId = "rec-book-1",
-          chapterIndex = 1,
-          title = "Cap 1",
-          contentText = "Texto corto del trabajador.",
-          wordCount = 4,
-          characterCount = 27,
-          estimatedMinutes = 1,
-          audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
-          audioFilePath = null,
-        )
-      ),
-    )
-    dao.upsertGenerationTask(
-      GenerationTaskEntity(
-        bookId = "rec-book-1",
-        queueOrder = 1L,
-        voiceName = NarratorVoice.MALE.name,
-        status = GenerationTaskStatus.INTERRUPTED_BY_OS.name,
-        startedAtMs = 1L,
-        updatedAtMs = 1L,
-      )
-    )
-
-    val okProvider =
-      object : AudioSynthesisProvider {
-        override val isConfigured = true
-        override val providerName = "WorkerPiper"
-        override val modelId = "es_ES-sharvard-medium"
-
-        override suspend fun synthesizeFragment(
-          text: String,
-          voice: NarratorVoice,
-          bookTitle: String,
-          chapterTitle: String,
-        ): Result<SynthesizedAudioPayload> =
-          Result.success(
-            SynthesizedAudioPayload(
-              bytes = ByteArray(4410) { 3 },
-              mimeType = "audio/L16;rate=22050;channels=1",
-              sampleRate = 22_050,
-            )
-          )
-      }
-
-    val repo =
-      trackRepo(
-        AudiobookRepository(
-          context = context,
-          dao = dao,
-          storageManager = storageManager,
-          audioSynthesisProvider = okProvider,
-        )
-      )
-
-    // Ejecutar directamente la lógica del Worker con la BD real de prueba
-    val workerResult = repo.runRecoverableTasksInWorker()
-    assertEquals(ListenableWorker.Result.success(), workerResult)
-    assertEquals(GenerationTaskStatus.COMPLETED.name, dao.getGenerationTaskOnce("rec-book-1")?.status)
-    assertEquals(
-      AudioGenerationStatus.READY.name,
-      dao.getChaptersOnce("rec-book-1").single().audioStatus,
-    )
-
-    // Comprobar además TestListenableWorkerBuilder cuando ya no quedan tareas pendientes en AppDatabase vacío
-    val worker = TestListenableWorkerBuilder<AudiobookRecoveryWorker>(context).build()
-    worker.repositoryOverride = repo
-    val idleWorkerResult = worker.doWork()
-    assertEquals(ListenableWorker.Result.success(), idleWorkerResult)
-  }
-
-  @Test
-  fun `I_service_START_STICKY_null_intent_restores_db_queue_and_explicit_cancel_releases_WakeLock`() =
-    runTest {
-      val dao = db.audiobookDao()
-      dao.insertBookWithChapters(
-        BookEntity(
-          id = "svc-book-1",
-          title = "Libro Sticky",
-          author = "Autor",
-          language = "es",
-          publisher = "",
-          description = "",
-          coverImagePath = null,
-          sourceFileName = "sticky.epub",
-          selectedVoice = NarratorVoice.MALE.name,
-          totalChapters = 1,
-          totalWords = 5,
-          totalCharacters = 28,
-          estimatedMinutes = 1,
-          importedAt = 10L,
-        ),
-        listOf(
-          ChapterEntity(
-            id = "svc-book-1_ch_1",
-            bookId = "svc-book-1",
-            chapterIndex = 1,
-            title = "Cap 1",
-            contentText = "Texto reanudado por START_STICKY.",
-            wordCount = 5,
-            characterCount = 34,
-            estimatedMinutes = 1,
-            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
-            audioFilePath = null,
-          )
-        ),
-      )
-      dao.upsertGenerationTask(
-        GenerationTaskEntity(
-          bookId = "svc-book-1",
-          queueOrder = 1L,
-          voiceName = NarratorVoice.MALE.name,
-          status = GenerationTaskStatus.INTERRUPTED_BY_OS.name,
-          startedAtMs = 1L,
-          updatedAtMs = 1L,
-        )
-      )
-
-      val blockingLatch = CountDownLatch(1)
-      val slowProvider =
-        object : AudioSynthesisProvider {
-          override val isConfigured = true
-          override val providerName = "StickyTest"
-          override val modelId = "es_ES-sharvard-medium"
-
-          override suspend fun synthesizeFragment(
-            text: String,
-            voice: NarratorVoice,
-            bookTitle: String,
-            chapterTitle: String,
-          ): Result<SynthesizedAudioPayload> {
-            blockingLatch.countDown()
-            delay(30_000L)
-            return Result.success(
-              SynthesizedAudioPayload(
-                bytes = ByteArray(4410) { 2 },
-                mimeType = "audio/L16;rate=22050;channels=1",
-                sampleRate = 22_050,
-              )
-            )
-          }
-        }
-
-      val repo =
-        trackRepo(
-          AudiobookRepository(
-            context = context,
-            dao = dao,
-            storageManager = storageManager,
-            audioSynthesisProvider = slowProvider,
-          )
-        )
-
-      val serviceController = Robolectric.buildService(AudiobookGenerationService::class.java)
-      val service = serviceController.create().get()
-      service.repositoryOverride = repo
-
-      // Reinicio por el SO sin Intent (null)
-      val stickyResult = service.onStartCommand(null, 0, 1)
-      assertEquals(android.app.Service.START_STICKY, stickyResult)
-      assertTrue(service.isWakeLockHeldForTesting())
-
-      // Avanzar Looper principal para permitir que la corrutina de onStartCommand restaure desde Room
-      var reachedSynth = false
-      for (i in 1..40) {
-        org.robolectric.shadows.ShadowLooper.idleMainLooper()
-        if (blockingLatch.await(25, TimeUnit.MILLISECONDS)) {
-          reachedSynth = true
-          break
-        }
-      }
-      assertTrue("START_STICKY null intent should restore persisted Room task", reachedSynth)
-
-      // Pausa explícita del usuario libera WakeLock inmediatamente y persiste PAUSED_BY_USER
-      val pauseIntent =
-        Intent(context, AudiobookGenerationService::class.java).apply {
-          action = AudiobookGenerationService.ACTION_PAUSE_GENERATION
-          putExtra(AudiobookGenerationService.EXTRA_BOOK_ID, "svc-book-1")
-        }
-      service.onStartCommand(pauseIntent, 0, 2)
-      org.robolectric.shadows.ShadowLooper.idleMainLooper()
-      assertFalse(service.isWakeLockHeldForTesting())
-
-      repo.awaitPersistenceForTesting()
-      val pausedStatus = dao.getGenerationTaskOnce("svc-book-1")?.status
-      assertEquals(GenerationTaskStatus.PAUSED_BY_USER.name, pausedStatus)
-
-      serviceController.destroy()
-      service.awaitJobsForTesting()
-      repo.awaitAndCloseForTesting()
-    }
-
-  @Test
-  fun `J_explicit_cancel_persists_CANCELLED_cleans_orphans_and_prevents_auto_recovery`() = runTest {
-    val dao = db.audiobookDao()
-    dao.insertBookWithChapters(
-      BookEntity(
-        id = "cancel-book-1",
-        title = "Libro Cancelable",
-        author = "Autor",
-        language = "es",
-        publisher = "",
-        description = "",
-        coverImagePath = null,
-        sourceFileName = "cancel.epub",
-        selectedVoice = NarratorVoice.FEMALE.name,
-        totalChapters = 1,
-        totalWords = 6,
-        totalCharacters = 40,
-        estimatedMinutes = 1,
-        importedAt = 10L,
-      ),
-      listOf(
-        ChapterEntity(
-          id = "cancel-book-1_ch_1",
-          bookId = "cancel-book-1",
-          chapterIndex = 1,
-          title = "Cap 1",
-          contentText = "Texto de capítulo para probar cancelación definitiva.",
-          wordCount = 7,
-          characterCount = 54,
-          estimatedMinutes = 1,
-          audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
-          audioFilePath = null,
-        )
-      ),
-    )
-
-    val orphanTmp = File(storageManager.chunkWavFile("cancel-book-1", 1, 0).parentFile, "orphan_part_0.wav.tmp")
-    orphanTmp.writeBytes(byteArrayOf(1, 2, 3, 4))
-    assertTrue(orphanTmp.exists())
-
-    val blockingLatch = CountDownLatch(1)
-    val slowProvider =
-      object : AudioSynthesisProvider {
-        override val isConfigured = true
-        override val providerName = "CancelTest"
-        override val modelId = "es_ES-sharvard-medium"
-
-        override suspend fun synthesizeFragment(
-          text: String,
-          voice: NarratorVoice,
-          bookTitle: String,
-          chapterTitle: String,
-        ): Result<SynthesizedAudioPayload> {
-          blockingLatch.countDown()
-          delay(30_000L)
-          return Result.success(
-            SynthesizedAudioPayload(
-              bytes = ByteArray(4410) { 2 },
-              mimeType = "audio/L16;rate=22050;channels=1",
-              sampleRate = 22_050,
-            )
-          )
-        }
-      }
-
-    val repo =
-      trackRepo(
-        AudiobookRepository(
-          context = context,
-          dao = dao,
-          storageManager = storageManager,
-          audioSynthesisProvider = slowProvider,
-        )
-      )
-
-    val serviceController = Robolectric.buildService(AudiobookGenerationService::class.java)
-    val service = serviceController.create().get()
-    service.repositoryOverride = repo
-
-    val startIntent =
-      Intent(context, AudiobookGenerationService::class.java).apply {
-        action = AudiobookGenerationService.ACTION_START_GENERATION
-        putExtra(AudiobookGenerationService.EXTRA_BOOK_ID, "cancel-book-1")
-      }
-    service.onStartCommand(startIntent, 0, 1)
-    assertTrue("Should reach slow synth fragment", blockingLatch.await(5, TimeUnit.SECONDS))
-
-    val cancelIntent =
-      Intent(context, AudiobookGenerationService::class.java).apply {
-        action = AudiobookGenerationService.ACTION_CANCEL_GENERATION
-        putExtra(AudiobookGenerationService.EXTRA_BOOK_ID, "cancel-book-1")
-      }
-    service.onStartCommand(cancelIntent, 0, 2)
-    org.robolectric.shadows.ShadowLooper.idleMainLooper()
-    assertFalse(service.isWakeLockHeldForTesting())
-
-    repo.awaitPersistenceForTesting()
-    val cancelledTask = dao.getGenerationTaskOnce("cancel-book-1")
-    assertEquals(GenerationTaskStatus.CANCELLED.name, cancelledTask?.status)
-    assertTrue("CANCELLED task must not be recoverable", dao.getRecoverableGenerationTasksOnce().isEmpty())
-    assertFalse("Orphan temp file must be removed", orphanTmp.exists())
-
-    serviceController.destroy()
-    service.awaitJobsForTesting()
-    repo.awaitAndCloseForTesting()
-  }
 }

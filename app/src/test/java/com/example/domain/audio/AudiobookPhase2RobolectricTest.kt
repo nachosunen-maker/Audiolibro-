@@ -63,9 +63,13 @@ class AudiobookPhase2RobolectricTest {
   private lateinit var db: AppDatabase
   private lateinit var storageManager: AudiobookStorageManager
   private val trackedRepos = mutableListOf<AudiobookRepository>()
+  private val trackedControllers = mutableListOf<AudiobookPlaybackController>()
 
   private fun trackRepo(repo: AudiobookRepository): AudiobookRepository =
     repo.also { trackedRepos += it }
+
+  private fun trackController(controller: AudiobookPlaybackController): AudiobookPlaybackController =
+    controller.also { trackedControllers += it }
 
   @Before
   fun setUp() {
@@ -79,6 +83,8 @@ class AudiobookPhase2RobolectricTest {
   @After
   fun tearDown() {
     runBlocking {
+      trackedControllers.forEach { it.awaitAndReleaseForTesting() }
+      trackedControllers.clear()
       trackedRepos.forEach { it.awaitAndCloseForTesting() }
       trackedRepos.clear()
     }
@@ -122,7 +128,19 @@ class AudiobookPhase2RobolectricTest {
         }
 
       val orchestrator = AudiobookGenerationOrchestrator(dao, storageManager, failingProvider)
-      val result = orchestrator.generateBookAudiobook("book-1")
+      val estimator = RtfEstimator()
+      val result =
+        orchestrator.prepareAndGenerateProgressiveChapter(
+          bookId = "book-1",
+          chapterIndex = 1,
+          rtfEstimator = estimator,
+          deviceProfile = DeviceResourceProfile(),
+          playbackStateProvider = { ProgressivePlaybackSnapshot() },
+          isPausedProvider = { false },
+          sessionActiveProvider = { true },
+          awaitSignal = {},
+          onProgressiveState = {},
+        )
 
       assertTrue(result.isFailure)
       val chapters = dao.getChaptersOnce("book-1")
@@ -169,7 +187,18 @@ class AudiobookPhase2RobolectricTest {
       }
 
     val orchestrator = AudiobookGenerationOrchestrator(dao, storageManager, testProvider)
-    val res = orchestrator.generateBookAudiobook("book-1")
+    val res =
+      orchestrator.prepareAndGenerateProgressiveChapter(
+        bookId = "book-1",
+        chapterIndex = 1,
+        rtfEstimator = RtfEstimator(),
+        deviceProfile = DeviceResourceProfile(),
+        playbackStateProvider = { ProgressivePlaybackSnapshot() },
+        isPausedProvider = { false },
+        sessionActiveProvider = { true },
+        awaitSignal = {},
+        onProgressiveState = {},
+      )
     assertTrue(res.isSuccess)
     assertTrue(observedVoices.isNotEmpty())
     assertTrue(observedVoices.all { it == NarratorVoice.MALE })
@@ -262,9 +291,35 @@ class AudiobookPhase2RobolectricTest {
         }
 
       val orchestrator = AudiobookGenerationOrchestrator(dao, storageManager, flakyProvider)
+      val estimator = RtfEstimator()
 
-      val firstAttempt = orchestrator.generateBookAudiobook("book-2")
-      assertTrue(firstAttempt.isFailure)
+      val ch1Result =
+        orchestrator.prepareAndGenerateProgressiveChapter(
+          bookId = "book-2",
+          chapterIndex = 1,
+          rtfEstimator = estimator,
+          deviceProfile = DeviceResourceProfile(),
+          playbackStateProvider = { ProgressivePlaybackSnapshot() },
+          isPausedProvider = { false },
+          sessionActiveProvider = { true },
+          awaitSignal = {},
+          onProgressiveState = {},
+        )
+      assertTrue(ch1Result.isSuccess)
+
+      val firstCh2Attempt =
+        orchestrator.prepareAndGenerateProgressiveChapter(
+          bookId = "book-2",
+          chapterIndex = 2,
+          rtfEstimator = estimator,
+          deviceProfile = DeviceResourceProfile(),
+          playbackStateProvider = { ProgressivePlaybackSnapshot() },
+          isPausedProvider = { false },
+          sessionActiveProvider = { true },
+          awaitSignal = {},
+          onProgressiveState = {},
+        )
+      assertTrue(firstCh2Attempt.isFailure)
 
       val afterFailCh1 = dao.getChaptersOnce("book-2").first { it.chapterIndex == 1 }
       val afterFailCh2 = dao.getChaptersOnce("book-2").first { it.chapterIndex == 2 }
@@ -273,7 +328,18 @@ class AudiobookPhase2RobolectricTest {
       assertEquals(1, afterFailCh2.generatedChunks)
       assertEquals(2, synthesizedTexts.size)
 
-      val resumeAttempt = orchestrator.generateBookAudiobook("book-2")
+      val resumeAttempt =
+        orchestrator.prepareAndGenerateProgressiveChapter(
+          bookId = "book-2",
+          chapterIndex = 2,
+          rtfEstimator = estimator,
+          deviceProfile = DeviceResourceProfile(),
+          playbackStateProvider = { ProgressivePlaybackSnapshot() },
+          isPausedProvider = { false },
+          sessionActiveProvider = { true },
+          awaitSignal = {},
+          onProgressiveState = {},
+        )
       assertTrue(resumeAttempt.isSuccess)
 
       assertEquals(1 + expectedCh2Fragments.size, synthesizedTexts.size)
@@ -386,40 +452,42 @@ class AudiobookPhase2RobolectricTest {
 
     val testPlayer = InMemoryPlaylistPlayer()
     val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
-    val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
-    val book = dao.getBookOnce("book-1")!!.toDomain()
-    val chapters = dao.getChaptersOnce("book-1").map { it.toDomain() }
+    val controller = trackController(AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer))
+    try {
+      val book = dao.getBookOnce("book-1")!!.toDomain()
+      val chapters = dao.getChaptersOnce("book-1").map { it.toDomain() }
 
-    controller.playBook(book, chapters, startChapterIndex = 1, startPositionMs = 500L)
-    var state = controller.uiState.first { it.activeBookId == "book-1" }
-    assertEquals(1, state.currentChapterIndex)
-    assertTrue(state.isPlaying)
-    assertEquals(500L, state.positionMs)
+      controller.playBook(book, chapters, startChapterIndex = 1, startPositionMs = 500L)
+      var state = controller.uiState.first { it.activeBookId == "book-1" }
+      assertEquals(1, state.currentChapterIndex)
+      assertTrue(state.isPlaying)
+      assertEquals(500L, state.positionMs)
 
-    controller.seekForward(400L)
-    state = controller.uiState.value
-    assertEquals(900L, state.positionMs)
+      controller.seekForward(400L)
+      state = controller.uiState.value
+      assertEquals(900L, state.positionMs)
 
-    controller.nextChapter()
-    state = controller.uiState.value
-    assertEquals(2, state.currentChapterIndex)
-    assertEquals("Capítulo 2", state.currentChapterTitle)
+      controller.nextChapter()
+      state = controller.uiState.value
+      assertEquals(2, state.currentChapterIndex)
+      assertEquals("Capítulo 2", state.currentChapterTitle)
 
-    controller.togglePlayPause()
-    assertFalse(controller.uiState.value.isPlaying)
+      controller.togglePlayPause()
+      assertFalse(controller.uiState.value.isPlaying)
 
-    controller.jumpToChapter(1)
-    assertEquals(1, controller.uiState.value.currentChapterIndex)
-    assertTrue(controller.uiState.value.isPlaying)
-    controller.awaitPersistenceForTesting()
+      controller.jumpToChapter(1)
+      assertEquals(1, controller.uiState.value.currentChapterIndex)
+      assertTrue(controller.uiState.value.isPlaying)
+      controller.awaitPersistenceForTesting()
 
-    repo.updatePlaybackPosition("book-1", 2, 1100L)
-    val savedBook = dao.getBookOnce("book-1")
-    assertEquals(2, savedBook?.lastPlayedChapterIndex)
-    assertEquals(1100L, savedBook?.lastPlayedPositionMs)
-
-    controller.releaseForTesting()
-    testPlayer.release()
+      repo.updatePlaybackPosition("book-1", 2, 1100L)
+      val savedBook = dao.getBookOnce("book-1")
+      assertEquals(2, savedBook?.lastPlayedChapterIndex)
+      assertEquals(1100L, savedBook?.lastPlayedPositionMs)
+    } finally {
+      controller.awaitAndReleaseForTesting()
+      testPlayer.release()
+    }
   }
 
   @Test
@@ -435,55 +503,63 @@ class AudiobookPhase2RobolectricTest {
     insertSampleBook(dao, "book-1", NarratorVoice.FEMALE)
     val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
     val testPlayer = InMemoryPlaylistPlayer()
-    val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
+    val controller = trackController(AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer))
     val vm = BookDetailViewModel("book-1", repo, controller)
 
-    composeRule.setContent {
-      AudiolibroTheme {
-        BookDetailScreen(
-          viewModel = vm,
-          onNavigateBack = {},
-          onOpenChapterText = { _, _ -> },
-          onOpenPlayer = { _, _ -> },
-        )
+    try {
+      composeRule.setContent {
+        AudiolibroTheme {
+          BookDetailScreen(
+            viewModel = vm,
+            onNavigateBack = {},
+            onOpenChapterText = { _, _ -> },
+            onOpenPlayer = { _, _ -> },
+          )
+        }
       }
-    }
 
-    composeRule.waitUntil(timeoutMillis = 5_000L) {
-      composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
-    }
-    composeRule.onNode(hasScrollToNodeAction()).performScrollToNode(hasTestTag("voice_male_card"))
-    composeRule.onNodeWithTag("voice_male_card").assertIsDisplayed().performClick()
-    composeRule
-      .onNode(hasScrollToNodeAction())
-      .performScrollToNode(hasTestTag("generate_audiobook_button"))
-    composeRule.onNodeWithTag("generate_audiobook_button").assertIsDisplayed()
-    composeRule.waitUntil(timeoutMillis = 5_000L) {
-      runCatching {
-        kotlinx.coroutines.runBlocking { dao.getBookOnce("book-1")?.selectedVoice == NarratorVoice.MALE.name }
-      }.getOrDefault(false)
-    }
-    assertEquals(NarratorVoice.MALE.name, dao.getBookOnce("book-1")?.selectedVoice)
+      composeRule.waitUntil(timeoutMillis = 5_000L) {
+        composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
+      }
+      composeRule.onNode(hasScrollToNodeAction()).performScrollToNode(hasTestTag("voice_male_card"))
+      composeRule.onNodeWithTag("voice_male_card").assertIsDisplayed().performClick()
+      assertTrue(
+        composeRule.onAllNodesWithTag("generate_audiobook_button").fetchSemanticsNodes().isEmpty()
+      )
+      assertTrue(
+        composeRule.onAllNodesWithTag("generation_interrupted_banner").fetchSemanticsNodes().isEmpty()
+      )
+      composeRule
+        .onNode(hasScrollToNodeAction())
+        .performScrollToNode(hasTestTag("load_chapter_1"))
+      composeRule.onNodeWithTag("load_chapter_1").assertIsDisplayed()
+      composeRule.waitUntil(timeoutMillis = 5_000L) {
+        runCatching {
+          kotlinx.coroutines.runBlocking { dao.getBookOnce("book-1")?.selectedVoice == NarratorVoice.MALE.name }
+        }.getOrDefault(false)
+      }
+      assertEquals(NarratorVoice.MALE.name, dao.getBookOnce("book-1")?.selectedVoice)
 
-    // Verify LegalNoticesDialog opens from BookDetailScreen and lists required licenses & notice
-    composeRule
-      .onNode(hasScrollToNodeAction())
-      .performScrollToNode(hasTestTag("detail_legal_notices_button"))
-    composeRule.onNodeWithTag("detail_legal_notices_button").performClick()
-    composeRule.waitForIdle()
-    composeRule.onNodeWithTag("legal_notices_dialog").assertIsDisplayed()
-    composeRule.onNodeWithText("Apache License 2.0", substring = true).assertIsDisplayed()
-    composeRule.onNodeWithText("MIT License", substring = true).assertIsDisplayed()
-    composeRule.onNodeWithText("Corpus SHARVARD", substring = true).performScrollTo().assertIsDisplayed()
-    composeRule
-      .onNodeWithText("GNU General Public License v3.0+", substring = true)
-      .performScrollTo()
-      .assertIsDisplayed()
-    composeRule.onNodeWithTag("close_legal_notices_button").performClick()
-    composeRule.waitForIdle()
-
-    controller.releaseForTesting()
-    testPlayer.release()
+      // Verify LegalNoticesDialog opens from BookDetailScreen and lists required licenses & notice
+      composeRule
+        .onNode(hasScrollToNodeAction())
+        .performScrollToNode(hasTestTag("detail_legal_notices_button"))
+      composeRule.onNodeWithTag("detail_legal_notices_button").performClick()
+      composeRule.waitForIdle()
+      composeRule.onNodeWithTag("legal_notices_dialog").assertIsDisplayed()
+      composeRule.onNodeWithText("Apache License 2.0", substring = true).assertIsDisplayed()
+      composeRule.onNodeWithText("MIT License", substring = true).assertIsDisplayed()
+      composeRule.onNodeWithText("Corpus SHARVARD", substring = true).performScrollTo().assertIsDisplayed()
+      composeRule
+        .onNodeWithText("GNU General Public License v3.0+", substring = true)
+        .performScrollTo()
+        .assertIsDisplayed()
+      composeRule.onNodeWithTag("close_legal_notices_button").performClick()
+      composeRule.waitForIdle()
+    } finally {
+      controller.awaitAndReleaseForTesting()
+      testPlayer.release()
+    }
   }
 
   @Test
@@ -556,19 +632,31 @@ class AudiobookPhase2RobolectricTest {
         }
 
       val orchestrator = AudiobookGenerationOrchestrator(dao, storageManager, provider)
-      val res = orchestrator.generateBookAudiobook(longBookId)
+      val res =
+        orchestrator.prepareAndGenerateProgressiveChapter(
+          bookId = longBookId,
+          chapterIndex = 1,
+          rtfEstimator = RtfEstimator(),
+          deviceProfile = DeviceResourceProfile(),
+          playbackStateProvider = { ProgressivePlaybackSnapshot() },
+          isPausedProvider = { false },
+          sessionActiveProvider = { true },
+          awaitSignal = {},
+          onProgressiveState = {},
+        )
       assertTrue(res.isSuccess)
       val chunksPerChapter = ChapterTextChunker.splitChapter(longParagraph).size
       assertTrue(chunksPerChapter >= 2)
-      assertEquals(chapterCount * chunksPerChapter, synthCount)
+      assertEquals(chunksPerChapter, synthCount)
 
-      val readyChapters = dao.getChaptersOnce(longBookId)
-      assertTrue(readyChapters.all { it.audioStatus == AudioGenerationStatus.READY.name })
+      val chaptersAfter = dao.getChaptersOnce(longBookId)
+      val ch1 = chaptersAfter.first { it.chapterIndex == 1 }
+      assertEquals(AudioGenerationStatus.READY.name, ch1.audioStatus)
+      val info = WavAudioCodec.readWavInfo(File(ch1.audioFilePath!!))
+      assertNotNull(info)
+      assertEquals(22_050, info!!.sampleRate)
       assertTrue(
-        readyChapters.all {
-          val info = WavAudioCodec.readWavInfo(File(it.audioFilePath!!))
-          info != null && info.sampleRate == 22_050
-        }
+        chaptersAfter.filter { it.chapterIndex > 1 }.all { it.audioStatus == AudioGenerationStatus.NOT_GENERATED.name }
       )
       storageManager.deleteBookAudioFiles(longBookId)
     }
@@ -782,14 +870,11 @@ class AudiobookPhase2RobolectricTest {
   }
 
   @Test
-  fun `generation exception during initial prep sets isRunning false and stores error message`() = runTest {
+  fun `progressive load on non-existent book exits cleanly without crashing`() = runTest {
     val dao = db.audiobookDao()
-    val repo = trackRepo(AudiobookRepository(context, dao))
-    repo.startAudiobookGeneration("non-existent-book-id")
-    val progress = repo.generationProgress.map { it["non-existent-book-id"] }.first { it != null && !it.isRunning }
-    assertNotNull(progress)
-    assertFalse(progress!!.isRunning)
-    assertNotNull(progress.errorMessage)
+    val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
+    repo.startProgressiveChapterLoading("non-existent-book-id", 1)
+    assertNull(dao.getBookOnce("non-existent-book-id"))
   }
 
   @Test
@@ -799,40 +884,42 @@ class AudiobookPhase2RobolectricTest {
       insertSampleBook(dao, "book-1", NarratorVoice.FEMALE)
       val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
       val testPlayer = InMemoryPlaylistPlayer()
-      val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
+      val controller = trackController(AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer))
       val vm = BookDetailViewModel("book-1", repo, controller)
 
-      composeRule.setContent {
-        AudiolibroTheme {
-          BookDetailScreen(
-            viewModel = vm,
-            onNavigateBack = {},
-            onOpenChapterText = { _, _ -> },
-            onOpenPlayer = { _, _ -> },
-          )
+      try {
+        composeRule.setContent {
+          AudiolibroTheme {
+            BookDetailScreen(
+              viewModel = vm,
+              onNavigateBack = {},
+              onOpenChapterText = { _, _ -> },
+              onOpenPlayer = { _, _ -> },
+            )
+          }
         }
-      }
 
-      composeRule.waitUntil(timeoutMillis = 5_000L) {
-        composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
-      }
-      assertTrue(
+        composeRule.waitUntil(timeoutMillis = 5_000L) {
+          composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
+        }
+        assertTrue(
+          composeRule
+            .onAllNodesWithTag("debug_appcheck_diagnostic_section")
+            .fetchSemanticsNodes()
+            .isEmpty()
+        )
         composeRule
-          .onAllNodesWithTag("debug_appcheck_diagnostic_section")
-          .fetchSemanticsNodes()
-          .isEmpty()
-      )
-      composeRule
-        .onNode(hasScrollToNodeAction())
-        .performScrollToNode(hasTestTag("detail_legal_notices_button"))
-      composeRule.onNodeWithText("100 % local sin conexión · es_ES-sharvard-medium").assertIsDisplayed()
-
-      controller.releaseForTesting()
-      testPlayer.release()
+          .onNode(hasScrollToNodeAction())
+          .performScrollToNode(hasTestTag("detail_legal_notices_button"))
+        composeRule.onNodeWithText("100 % local sin conexión · es_ES-sharvard-medium").assertIsDisplayed()
+      } finally {
+        controller.awaitAndReleaseForTesting()
+        testPlayer.release()
+      }
     }
 
   @Test
-  fun `AudiobookGenerationService declares mediaProcessing and specialUse permissions creates channel and handles start cancel safely`() {
+  fun `manifest removes full-book batch generation permissions and service while keeping media playback`() {
     val pkgInfo =
       context.packageManager.getPackageInfo(
         context.packageName,
@@ -840,206 +927,18 @@ class AudiobookPhase2RobolectricTest {
           android.content.pm.PackageManager.GET_SERVICES,
       )
     val permissions = pkgInfo.requestedPermissions?.toSet().orEmpty()
-    assertTrue(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING))
-    assertTrue(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE))
+    assertTrue(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK))
+    assertTrue(permissions.contains(android.Manifest.permission.WAKE_LOCK))
+    assertFalse(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_MEDIA_PROCESSING))
+    assertFalse(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_SPECIAL_USE))
     assertFalse(permissions.contains(android.Manifest.permission.FOREGROUND_SERVICE_DATA_SYNC))
     assertFalse(permissions.contains(android.Manifest.permission.INTERNET))
-    assertEquals(0, AudiobookGenerationService.foregroundServiceTypeForSdk(33))
-    assertEquals(
-      android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE,
-      AudiobookGenerationService.foregroundServiceTypeForSdk(34),
-    )
-    assertEquals(
-      android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING,
-      AudiobookGenerationService.foregroundServiceTypeForSdk(35),
-    )
-    assertEquals(
-      android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING,
-      AudiobookGenerationService.foregroundServiceTypeForSdk(36),
-    )
     val serviceInfo =
       pkgInfo.services?.firstOrNull {
-        it.name == AudiobookGenerationService::class.java.name
+        it.name == AudiobookPlaybackService::class.java.name
       }
     assertNotNull(serviceInfo)
-
-    val dao = db.audiobookDao()
-    val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
-    val controller = Robolectric.buildService(AudiobookGenerationService::class.java)
-    val service = controller.create().get()
-    service.repositoryOverride = repo
-
-    val cancelIntent =
-      android.content.Intent(context, AudiobookGenerationService::class.java).apply {
-        action = AudiobookGenerationService.ACTION_CANCEL_GENERATION
-        putExtra(AudiobookGenerationService.EXTRA_BOOK_ID, "book-1")
-      }
-    service.onStartCommand(cancelIntent, 0, 1)
-
-    val nm =
-      context.getSystemService(Context.NOTIFICATION_SERVICE) as android.app.NotificationManager
-    assertNotNull(nm.getNotificationChannel(AudiobookGenerationService.CHANNEL_ID_GENERATION))
-    controller.destroy()
-    runBlocking {
-      service.awaitJobsForTesting()
-      repo.awaitAndCloseForTesting()
-    }
   }
-
-  @Test
-  fun `orchestrator prepares all chapters upfront and BookDetailScreen displays interrupted resume banner`() =
-    runTest {
-      val dao = db.audiobookDao()
-      dao.insertBookWithChapters(
-        BookEntity(
-          id = "book-prep",
-          title = "Obra Preparada",
-          author = "Autora",
-          language = "es",
-          publisher = "",
-          description = "",
-          coverImagePath = null,
-          sourceFileName = "prep.epub",
-          selectedVoice = NarratorVoice.FEMALE.name,
-          totalChapters = 2,
-          totalWords = 20,
-          totalCharacters = 120,
-          estimatedMinutes = 1,
-          importedAt = 100L,
-        ),
-        listOf(
-          ChapterEntity(
-            id = "book-prep_ch_1",
-            bookId = "book-prep",
-            chapterIndex = 1,
-            title = "Cap 1",
-            contentText = "Primer capítulo listo para sintetizar.",
-            wordCount = 5,
-            characterCount = 39,
-            estimatedMinutes = 1,
-            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
-            audioFilePath = null,
-          ),
-          ChapterEntity(
-            id = "book-prep_ch_2",
-            bookId = "book-prep",
-            chapterIndex = 2,
-            title = "Cap 2",
-            contentText = "Segundo capítulo preparado desde el principio.",
-            wordCount = 6,
-            characterCount = 46,
-            estimatedMinutes = 1,
-            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
-            audioFilePath = null,
-          ),
-        ),
-      )
-
-      var allChaptersPreparedBeforeFirstSynth = false
-      val checkingProvider =
-        object : AudioSynthesisProvider {
-          override val isConfigured = true
-          override val providerName = "Test"
-          override val modelId = "es_ES-sharvard-medium"
-
-          override suspend fun synthesizeFragment(
-            text: String,
-            voice: NarratorVoice,
-            bookTitle: String,
-            chapterTitle: String,
-          ): Result<SynthesizedAudioPayload> {
-            val chs = dao.getChaptersOnce("book-prep")
-            allChaptersPreparedBeforeFirstSynth = chs.all { it.totalChunks > 0 }
-            return Result.success(
-              SynthesizedAudioPayload(
-                bytes = ByteArray(4410) { 1 },
-                mimeType = "audio/L16;rate=22050;channels=1",
-                sampleRate = 22_050,
-              )
-            )
-          }
-        }
-
-      val observedProgress = mutableListOf<BookGenerationProgress>()
-      val orchestrator = AudiobookGenerationOrchestrator(dao, storageManager, checkingProvider)
-      val res =
-        orchestrator.generateBookAudiobook("book-prep") { prog ->
-          observedProgress += prog
-        }
-      assertTrue(res.isSuccess)
-      assertTrue(allChaptersPreparedBeforeFirstSynth)
-      assertEquals(GenerationPhase.COMPLETED, observedProgress.last().phase)
-      assertEquals(1f, observedProgress.last().globalProgressFraction, 0.001f)
-
-      // Simulate OS interruption on another book (chapter left in GENERATING with 0 ready chapters)
-      dao.insertBookWithChapters(
-        BookEntity(
-          id = "book-interrupted",
-          title = "Libro Interrumpido",
-          author = "Autor",
-          language = "es",
-          publisher = "",
-          description = "",
-          coverImagePath = null,
-          sourceFileName = "int.epub",
-          selectedVoice = NarratorVoice.MALE.name,
-          totalChapters = 1,
-          totalWords = 10,
-          totalCharacters = 60,
-          estimatedMinutes = 1,
-          importedAt = 200L,
-        ),
-        listOf(
-          ChapterEntity(
-            id = "book-interrupted_ch_1",
-            bookId = "book-interrupted",
-            chapterIndex = 1,
-            title = "Cap 1",
-            contentText = "Texto de prueba.",
-            wordCount = 3,
-            characterCount = 16,
-            estimatedMinutes = 1,
-            audioStatus = AudioGenerationStatus.GENERATING.name,
-            audioFilePath = null,
-            generatedChunks = 1,
-            totalChunks = 3,
-          )
-        ),
-      )
-
-      val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
-      val testPlayer = InMemoryPlaylistPlayer()
-      val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
-      val vm = BookDetailViewModel("book-interrupted", repo, controller)
-
-      composeRule.setContent {
-        AudiolibroTheme {
-          BookDetailScreen(
-            viewModel = vm,
-            onNavigateBack = {},
-            onOpenChapterText = { _, _ -> },
-            onOpenPlayer = { _, _ -> },
-          )
-        }
-      }
-
-      composeRule.waitUntil(timeoutMillis = 5_000L) {
-        composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
-      }
-      composeRule
-        .onNode(hasScrollToNodeAction())
-        .performScrollToNode(hasTestTag("generation_interrupted_banner"))
-      composeRule.onNodeWithTag("generation_interrupted_banner").assertIsDisplayed()
-      composeRule
-        .onNode(hasScrollToNodeAction())
-        .performScrollToNode(hasTestTag("generate_audiobook_button"))
-      composeRule.onNodeWithText("Reanudar generación").assertIsDisplayed()
-
-      controller.releaseForTesting()
-      testPlayer.release()
-      storageManager.deleteBookAudioFiles("book-prep")
-      storageManager.deleteBookAudioFiles("book-interrupted")
-    }
 }
 
 

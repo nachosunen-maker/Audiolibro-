@@ -1,12 +1,8 @@
 package com.example.ui.screens
 
-import android.Manifest
-import android.content.pm.PackageManager
-import android.os.Build
 import androidx.activity.compose.rememberLauncherForActivityResult
 import androidx.activity.result.contract.ActivityResultContracts
 import androidx.compose.foundation.BorderStroke
-import androidx.core.content.ContextCompat
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
@@ -34,6 +30,7 @@ import androidx.compose.material.icons.outlined.AutoAwesome
 import androidx.compose.material.icons.outlined.DeleteOutline
 import androidx.compose.material.icons.outlined.Download
 import androidx.compose.material.icons.outlined.FolderDelete
+import androidx.compose.material.icons.outlined.Gavel
 import androidx.compose.material.icons.outlined.GraphicEq
 import androidx.compose.material.icons.outlined.Language
 import androidx.compose.material.icons.outlined.PlayArrow
@@ -85,9 +82,6 @@ import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import androidx.lifecycle.compose.collectAsStateWithLifecycle
 import com.example.R
-import com.example.domain.audio.AudioSynthesisProvider
-import com.example.domain.audio.BookGenerationProgress
-import com.example.domain.audio.GenerationPhase
 import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.Book
 import com.example.domain.model.BookWithChapters
@@ -124,25 +118,7 @@ fun BookDetailScreen(
   var chapterQuery by remember { mutableStateOf("") }
   var pendingChapterToExport by remember { mutableStateOf<Chapter?>(null) }
 
-  val notificationPermissionLauncher =
-    rememberLauncherForActivityResult(ActivityResultContracts.RequestPermission()) { _ ->
-      // Aunque no se concedan notificaciones, el servicio local sigue ejecutando la síntesis offline.
-      viewModel.generateAudiobook()
-    }
 
-  val startGenerationWithNotificationCheck = remember(context, viewModel) {
-    {
-      val needsNotificationPermission =
-        Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU &&
-          ContextCompat.checkSelfPermission(context, Manifest.permission.POST_NOTIFICATIONS) !=
-            PackageManager.PERMISSION_GRANTED
-      if (needsNotificationPermission) {
-        notificationPermissionLauncher.launch(Manifest.permission.POST_NOTIFICATIONS)
-      } else {
-        viewModel.generateAudiobook()
-      }
-    }
-  }
 
   val createChapterWavLauncher =
     rememberLauncherForActivityResult(ActivityResultContracts.CreateDocument("audio/wav")) { uri ->
@@ -260,25 +236,12 @@ fun BookDetailScreen(
               item {
                 VoiceSelectionSection(
                   selectedVoice = book.selectedVoice,
-                  enabled = state.generationProgress?.isRunning != true,
+                  enabled = true,
                   onSelectVoice = viewModel::selectVoice,
                 )
               }
 
-              item {
-                AudiobookGenerationSection(
-                  bookWithChapters = bookWithChapters,
-                  audioProvider = viewModel.audioProvider,
-                  progress = state.generationProgress,
-                  generationTask = state.generationTask,
-                  onGenerate = startGenerationWithNotificationCheck,
-                  onPause = viewModel::pauseGeneration,
-                  onCancel = viewModel::cancelGeneration,
-                  onDismissError = viewModel::clearGenerationError,
-                  onOpenPlayer = { onOpenPlayer(book.id, null) },
-                  onOpenLegalNotices = { showLegalNoticesDialog = true },
-                )
-              }
+
 
               item {
                 StorageAndExportCard(
@@ -288,6 +251,13 @@ fun BookDetailScreen(
                     createFullBookWavLauncher.launch(viewModel.suggestedBookFileName(book.title))
                   },
                   onDeleteAudioOnly = { showDeleteAudioDialog = true },
+                )
+              }
+
+              item {
+                LocalEngineFooterCard(
+                  modelId = viewModel.audioProvider.modelId,
+                  onOpenLegalNotices = { showLegalNoticesDialog = true },
                 )
               }
 
@@ -687,342 +657,7 @@ private fun VoiceOptionCard(
   }
 }
 
-@Composable
-private fun AudiobookGenerationSection(
-  bookWithChapters: BookWithChapters,
-  audioProvider: AudioSynthesisProvider,
-  progress: BookGenerationProgress?,
-  generationTask: com.example.data.local.GenerationTaskEntity?,
-  onGenerate: () -> Unit,
-  onPause: () -> Unit,
-  onCancel: () -> Unit,
-  onDismissError: () -> Unit,
-  onOpenPlayer: () -> Unit,
-  onOpenLegalNotices: () -> Unit,
-) {
-  val book = bookWithChapters.book
-  val chapters = bookWithChapters.chapters
-  val readyCount = bookWithChapters.readyChaptersCount
-  val totalCount = chapters.size
-  val isRunning = progress?.isRunning == true
-  val hasStaleGenerating =
-    !isRunning && chapters.any { it.audioStatus == AudioGenerationStatus.GENERATING }
-  val hasPartialChunks = chapters.any { it.generatedChunks > 0 }
-  val taskStatus = generationTask?.parsedStatus()
-  val isAutoRecoverPending =
-    !isRunning &&
-      !bookWithChapters.isCompleteAudiobookReady &&
-      taskStatus?.isRecoverable == true
-  val hasPartialProgress =
-    !bookWithChapters.isCompleteAudiobookReady &&
-      (readyCount > 0 || hasPartialChunks || hasStaleGenerating ||
-        progress?.phase == GenerationPhase.INTERRUPTED ||
-        taskStatus == com.example.domain.model.GenerationTaskStatus.PAUSED_BY_USER ||
-        taskStatus == com.example.domain.model.GenerationTaskStatus.CANCELLED ||
-        isAutoRecoverPending)
-  val persistedChapterError =
-    chapters.firstOrNull { it.audioStatus == AudioGenerationStatus.ERROR }?.generationError
-  val effectiveErrorMessage =
-    progress?.errorMessage
-      ?: persistedChapterError
-      ?: generationTask?.errorMessage?.takeIf {
-        taskStatus == com.example.domain.model.GenerationTaskStatus.ERROR
-      }
 
-  Surface(
-    modifier = Modifier.fillMaxWidth(),
-    shape = MaterialTheme.shapes.large,
-    color = MaterialTheme.colorScheme.surface,
-    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
-  ) {
-    Column(
-      modifier = Modifier.padding(18.dp),
-      verticalArrangement = Arrangement.spacedBy(12.dp),
-    ) {
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-      ) {
-        Text(
-          text = "Conversión a audiolibro",
-          style = MaterialTheme.typography.titleMedium,
-          color = MaterialTheme.colorScheme.onSurface,
-        )
-        Surface(
-          shape = RoundedCornerShape(12.dp),
-          color =
-            if (bookWithChapters.isCompleteAudiobookReady) MaterialTheme.colorScheme.secondaryContainer
-            else MaterialTheme.colorScheme.surfaceVariant,
-        ) {
-          Text(
-            text = "$readyCount / $totalCount cap.",
-            style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
-            color =
-              if (bookWithChapters.isCompleteAudiobookReady) MaterialTheme.colorScheme.onSecondaryContainer
-              else MaterialTheme.colorScheme.onSurfaceVariant,
-            modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp),
-          )
-        }
-      }
-
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically,
-      ) {
-        Text(
-          text = "100 % local sin conexión · ${audioProvider.modelId}",
-          style = MaterialTheme.typography.bodySmall,
-          color = MaterialTheme.colorScheme.onSurfaceVariant,
-          modifier = Modifier.weight(1f),
-        )
-        TextButton(
-          onClick = onOpenLegalNotices,
-          contentPadding = PaddingValues(horizontal = 8.dp, vertical = 4.dp),
-          modifier = Modifier.testTag("detail_legal_notices_button"),
-        ) {
-          Text("Licencias y voz", style = MaterialTheme.typography.labelMedium)
-        }
-      }
-
-      if (!audioProvider.isConfigured) {
-        Surface(
-          modifier = Modifier.fillMaxWidth(),
-          shape = MaterialTheme.shapes.medium,
-          color = MaterialTheme.colorScheme.errorContainer.copy(alpha = 0.7f),
-          border = BorderStroke(1.dp, MaterialTheme.colorScheme.error.copy(alpha = 0.4f)),
-        ) {
-          Row(
-            modifier = Modifier.padding(12.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.Top,
-          ) {
-            Icon(
-              imageVector = Icons.Outlined.WarningAmber,
-              contentDescription = null,
-              tint = MaterialTheme.colorScheme.onErrorContainer,
-              modifier = Modifier.size(20.dp),
-            )
-            Column(verticalArrangement = Arrangement.spacedBy(2.dp)) {
-              Text(
-                text = "Modelo local no disponible (${audioProvider.modelId})",
-                style = MaterialTheme.typography.labelLarge,
-                color = MaterialTheme.colorScheme.onErrorContainer,
-              )
-              Text(
-                text =
-                  "No se encontraron los archivos empaquetados de Piper / sherpa-onnx en assets. Reinstala o compila el paquete completo.",
-                style = MaterialTheme.typography.bodySmall,
-                color = MaterialTheme.colorScheme.onErrorContainer,
-              )
-            }
-          }
-        }
-      }
-
-      if (isRunning && progress != null) {
-        Column(
-          modifier = Modifier.testTag("generation_progress_section"),
-          verticalArrangement = Arrangement.spacedBy(6.dp),
-        ) {
-          val fraction = progress.globalProgressFraction
-          val percent = (fraction * 100f).roundToInt().coerceIn(0, 100)
-          if (progress.phase == GenerationPhase.PREPARING && progress.totalBookChunks == 0) {
-            LinearProgressIndicator(
-              modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
-            )
-          } else {
-            LinearProgressIndicator(
-              progress = { fraction },
-              modifier = Modifier.fillMaxWidth().clip(RoundedCornerShape(4.dp)),
-            )
-          }
-          Row(
-            modifier = Modifier.fillMaxWidth(),
-            horizontalArrangement = Arrangement.SpaceBetween,
-            verticalAlignment = Alignment.CenterVertically,
-          ) {
-            Text(
-              text = progress.statusMessage.ifBlank { "Generando audio…" },
-              style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-              color = MaterialTheme.colorScheme.primary,
-              modifier = Modifier.weight(1f),
-            )
-            if (progress.totalBookChunks > 0) {
-              Text(
-                text = "$percent %",
-                style = MaterialTheme.typography.labelMedium.copy(fontWeight = FontWeight.Bold),
-                color = MaterialTheme.colorScheme.primary,
-              )
-            }
-          }
-          Text(
-            text = "Continúa en segundo plano incluso con la pantalla apagada.",
-            style = MaterialTheme.typography.labelSmall,
-            color = MaterialTheme.colorScheme.onSurfaceVariant,
-          )
-        }
-      } else if (hasPartialProgress && effectiveErrorMessage.isNullOrBlank()) {
-        val bannerTitle =
-          when {
-            isAutoRecoverPending -> "Generación en cola · reanudación automática activa"
-            taskStatus == com.example.domain.model.GenerationTaskStatus.PAUSED_BY_USER ->
-              "Generación pausada por el usuario"
-            taskStatus == com.example.domain.model.GenerationTaskStatus.CANCELLED ->
-              "Generación cancelada por el usuario"
-            else -> "Generación interrumpida · pendiente de reanudación"
-          }
-        val bannerBody =
-          if (isAutoRecoverPending) {
-            "Los fragmentos y capítulos ya sintetizados permanecen guardados. La cola persistente reanudará automáticamente sin empezar desde cero."
-          } else {
-            "Los fragmentos y capítulos ya sintetizados permanecen guardados. Pulsa «Reanudar generación» para continuar sin empezar desde cero."
-          }
-        Surface(
-          modifier = Modifier.fillMaxWidth().testTag("generation_interrupted_banner"),
-          shape = MaterialTheme.shapes.medium,
-          color = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.65f),
-          border = BorderStroke(1.dp, MaterialTheme.colorScheme.tertiary.copy(alpha = 0.35f)),
-        ) {
-          Column(
-            modifier = Modifier.padding(12.dp),
-            verticalArrangement = Arrangement.spacedBy(4.dp),
-          ) {
-            Text(
-              text = bannerTitle,
-              style = MaterialTheme.typography.labelLarge,
-              color = MaterialTheme.colorScheme.onTertiaryContainer,
-            )
-            Text(
-              text = bannerBody,
-              style = MaterialTheme.typography.bodySmall,
-              color = MaterialTheme.colorScheme.onTertiaryContainer,
-            )
-          }
-        }
-      } else if (bookWithChapters.isCompleteAudiobookReady && !isRunning) {
-        Surface(
-          modifier = Modifier.fillMaxWidth().testTag("generation_completed_banner"),
-          shape = MaterialTheme.shapes.medium,
-          color = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.7f),
-        ) {
-          Row(
-            modifier = Modifier.padding(horizontal = 12.dp, vertical = 10.dp),
-            horizontalArrangement = Arrangement.spacedBy(8.dp),
-            verticalAlignment = Alignment.CenterVertically,
-          ) {
-            Icon(
-              imageVector = Icons.Rounded.CheckCircle,
-              contentDescription = null,
-              tint = MaterialTheme.colorScheme.secondary,
-              modifier = Modifier.size(18.dp),
-            )
-            Text(
-              text = "Audiolibro completo listo (${totalCount} capítulos · WAV 22.050 Hz mono)",
-              style = MaterialTheme.typography.bodySmall.copy(fontWeight = FontWeight.Medium),
-              color = MaterialTheme.colorScheme.onSecondaryContainer,
-            )
-          }
-        }
-      }
-
-      if (!effectiveErrorMessage.isNullOrBlank() && !isRunning) {
-        Surface(
-          modifier = Modifier.fillMaxWidth().testTag("generation_error_banner"),
-          shape = MaterialTheme.shapes.medium,
-          color = MaterialTheme.colorScheme.errorContainer,
-        ) {
-          Row(
-            modifier = Modifier.padding(12.dp),
-            horizontalArrangement = Arrangement.spacedBy(10.dp),
-            verticalAlignment = Alignment.CenterVertically,
-          ) {
-            Text(
-              text = effectiveErrorMessage,
-              style = MaterialTheme.typography.bodySmall,
-              color = MaterialTheme.colorScheme.onErrorContainer,
-              modifier = Modifier.weight(1f),
-            )
-            if (progress?.errorMessage != null) {
-              IconButton(
-                onClick = onDismissError,
-                modifier = Modifier.minimumInteractiveComponentSize(),
-              ) {
-                Icon(
-                  imageVector = Icons.Rounded.Close,
-                  contentDescription = "Cerrar aviso",
-                  tint = MaterialTheme.colorScheme.onErrorContainer,
-                )
-              }
-            }
-          }
-        }
-      }
-
-      Row(
-        modifier = Modifier.fillMaxWidth(),
-        horizontalArrangement = Arrangement.spacedBy(10.dp),
-      ) {
-        if (isRunning) {
-          OutlinedButton(
-            onClick = onPause,
-            modifier = Modifier.weight(1f).height(48.dp).testTag("pause_generation_button"),
-            shape = MaterialTheme.shapes.medium,
-          ) {
-            Icon(imageVector = Icons.Rounded.Pause, contentDescription = null)
-            Spacer(modifier = Modifier.width(6.dp))
-            Text("Pausar", maxLines = 1, overflow = TextOverflow.Ellipsis)
-          }
-          OutlinedButton(
-            onClick = onCancel,
-            modifier = Modifier.weight(1f).height(48.dp).testTag("cancel_generation_button"),
-            shape = MaterialTheme.shapes.medium,
-          ) {
-            Icon(imageVector = Icons.Rounded.Stop, contentDescription = null)
-            Spacer(modifier = Modifier.width(6.dp))
-            Text("Cancelar", maxLines = 1, overflow = TextOverflow.Ellipsis)
-          }
-        } else if (!bookWithChapters.isCompleteAudiobookReady) {
-          Button(
-            onClick = onGenerate,
-            modifier = Modifier.weight(1f).height(48.dp).testTag("generate_audiobook_button"),
-            shape = MaterialTheme.shapes.medium,
-          ) {
-            Icon(imageVector = Icons.Outlined.AutoAwesome, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-              text = if (hasPartialProgress) "Reanudar generación" else "Generar audiolibro",
-              style = MaterialTheme.typography.labelLarge,
-            )
-          }
-        }
-
-        if (readyCount > 0 || hasPartialChunks) {
-          val resumeLabel =
-            if (book.lastPlayedChapterIndex != null) {
-              "Continuar Cap. ${book.lastPlayedChapterIndex}"
-            } else {
-              "Abrir reproductor"
-            }
-          Button(
-            onClick = onOpenPlayer,
-            modifier = Modifier.weight(1f).height(48.dp).testTag("open_player_button"),
-            shape = MaterialTheme.shapes.medium,
-          ) {
-            Icon(imageVector = Icons.Rounded.Headphones, contentDescription = null)
-            Spacer(modifier = Modifier.width(8.dp))
-            Text(
-              text = resumeLabel,
-              maxLines = 1,
-              overflow = TextOverflow.Ellipsis,
-            )
-          }
-        }
-      }
-    }
-  }
-}
 
 @Composable
 private fun StorageAndExportCard(
@@ -1313,6 +948,61 @@ private fun ChapterStatusBadge(chapter: Chapter) {
       color = contentColor,
       modifier = Modifier.padding(horizontal = 8.dp, vertical = 4.dp),
     )
+  }
+}
+
+@Composable
+private fun LocalEngineFooterCard(
+  modelId: String,
+  onOpenLegalNotices: () -> Unit,
+) {
+  Surface(
+    modifier = Modifier.fillMaxWidth(),
+    shape = MaterialTheme.shapes.large,
+    color = MaterialTheme.colorScheme.surface,
+    border = BorderStroke(1.dp, MaterialTheme.colorScheme.outlineVariant),
+  ) {
+    Column(
+      modifier = Modifier.padding(18.dp),
+      verticalArrangement = Arrangement.spacedBy(10.dp),
+    ) {
+      Row(
+        modifier = Modifier.fillMaxWidth(),
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalAlignment = Alignment.CenterVertically,
+      ) {
+        Icon(
+          imageVector = Icons.Outlined.GraphicEq,
+          contentDescription = null,
+          tint = MaterialTheme.colorScheme.primary,
+          modifier = Modifier.size(18.dp),
+        )
+        Text(
+          text = "100 % local sin conexión · $modelId",
+          style = MaterialTheme.typography.labelLarge.copy(fontWeight = FontWeight.SemiBold),
+          color = MaterialTheme.colorScheme.onSurface,
+        )
+      }
+      Text(
+        text =
+          "Síntesis neuronal en el dispositivo. Cada capítulo se prepara bajo demanda según escuchas, liberando la memoria al avanzar.",
+        style = MaterialTheme.typography.bodySmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+      OutlinedButton(
+        onClick = onOpenLegalNotices,
+        modifier = Modifier.fillMaxWidth().minimumInteractiveComponentSize().testTag("detail_legal_notices_button"),
+        shape = MaterialTheme.shapes.medium,
+      ) {
+        Icon(
+          imageVector = Icons.Outlined.Gavel,
+          contentDescription = null,
+          modifier = Modifier.size(18.dp),
+        )
+        Spacer(modifier = Modifier.width(8.dp))
+        Text("Avisos legales y licencias")
+      }
+    }
   }
 }
 

@@ -6,14 +6,21 @@ import androidx.core.content.ContextCompat
 import androidx.media3.common.MediaItem
 import androidx.media3.common.PlaybackException
 import androidx.media3.common.Player
+import androidx.media3.common.Timeline
 import androidx.media3.session.MediaController
 import androidx.media3.session.SessionToken
 import com.example.data.repository.AudiobookRepository
+import com.example.domain.audio.DeviceCapabilityInspector
+import com.example.domain.audio.WavAudioCodec
 import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.Book
 import com.example.domain.model.Chapter
 import com.example.domain.model.ChapterChunk
+import com.example.domain.model.ProgressiveChapterPhase
 import com.google.common.util.concurrent.ListenableFuture
+import java.io.File
+import java.util.concurrent.atomic.AtomicInteger
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.Job
@@ -24,10 +31,13 @@ import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.MutableStateFlow
 import kotlinx.coroutines.flow.StateFlow
 import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.isActive
 import kotlinx.coroutines.launch
 import kotlinx.coroutines.withContext
+import kotlin.coroutines.coroutineContext
 
 data class PlaybackUiState(
   val isConnected: Boolean = false,
@@ -47,10 +57,12 @@ data class PlaybackUiState(
   val isWaitingForBuffer: Boolean = false,
   val playbackSpeed: Float = 1.0f,
   val lastPlayStartLatencyMs: Long = 0L,
+  val activeWindowSize: Int = 0,
+  val releasedChunksCount: Int = 0,
   val errorMessage: String? = null,
 ) {
   val hasActiveAudio: Boolean
-    get() = activeBookId != null && playlistChapters.isNotEmpty()
+    get() = activeBookId != null && (playlistChapters.isNotEmpty() || currentChapterIndex != null)
 }
 
 class AudiobookPlaybackController(
@@ -59,26 +71,38 @@ class AudiobookPlaybackController(
   private val injectedPlayer: Player? = null,
 ) {
 
-  private val scope = CoroutineScope(SupervisorJob() + Dispatchers.Main.immediate)
+  private val ownsPlayerDirectly: Boolean = injectedPlayer != null
+  private val controllerJob = SupervisorJob()
+  private val scope = CoroutineScope(controllerJob + Dispatchers.Main.immediate)
   private var controllerFuture: ListenableFuture<MediaController>? = null
   private var activePlayer: Player? = injectedPlayer
   private var tickerJob: Job? = null
   private var progressiveObserverJob: Job? = null
   private var progressivePlayJob: Job? = null
+  private var autoAdvanceJob: Job? = null
+  private var seekJob: Job? = null
+  private var persistenceConsumerJob: Job? = null
   private var pendingAction: ((Player) -> Unit)? = null
   private var lastSavedAtMs = 0L
   private var hydratingBookId: String? = null
+  private var hydratingProgressiveKey: Pair<String, Int>? = null
   private var restoreAttempted = false
-  private var progressiveChunks: List<ChapterChunk> = emptyList()
-  private var lastQueuedChunkIndex: Int = -1
+  private var progressiveChapterDurationMs: Long = 0L
+  private var progressiveTotalChunksCount: Int = 0
+  private var highestQueuedChunkIndex: Int = -1
+  private var activeWindowAheadMs: Long = AudiobookMediaHelper.DEFAULT_AHEAD_WINDOW_DURATION_MS
+  private val releasedChunkIndices = LinkedHashSet<Int>()
+  private val windowRefillTrigger = MutableStateFlow(0L)
+  private var isAutoAdvancing: Boolean = false
   private var playStartRequestedNs: Long = 0L
+  private val activeIoQueries = AtomicInteger(0)
   private val persistenceQueue = Channel<PersistenceRequest>(Channel.UNLIMITED)
 
   private sealed interface PersistenceRequest {
     data class Save(val bookId: String, val chapterIndex: Int, val positionMs: Long) :
       PersistenceRequest
 
-    data class Flush(val ack: kotlinx.coroutines.CompletableDeferred<Unit>) : PersistenceRequest
+    data class Flush(val ack: CompletableDeferred<Unit>) : PersistenceRequest
   }
 
   private val _uiState = MutableStateFlow(PlaybackUiState(isConnected = injectedPlayer != null))
@@ -94,6 +118,7 @@ class AudiobookPlaybackController(
         }
         syncFromPlayer()
         if (isPlaying) {
+          windowRefillTrigger.value += 1L
           startPositionTicker()
         } else {
           stopPositionTicker()
@@ -101,7 +126,30 @@ class AudiobookPlaybackController(
         }
       }
 
+      override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+        val player = activePlayer ?: return
+        if (reason == Player.TIMELINE_CHANGE_REASON_PLAYLIST_CHANGED) {
+          val maxInPlayer = AudiobookMediaHelper.maxChunkIndexInPlayer(player)
+          if (maxInPlayer >= 0) {
+            highestQueuedChunkIndex = maxInPlayer
+          } else if (player.mediaItemCount == 0) {
+            highestQueuedChunkIndex = -1
+          }
+          windowRefillTrigger.value += 1L
+          syncFromPlayer()
+        }
+      }
+
       override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+        val player = activePlayer
+        if (player != null && ownsPlayerDirectly) {
+          prunePlayedMediaItemsIfNeeded(player, reason)
+          val maxInPlayer = AudiobookMediaHelper.maxChunkIndexInPlayer(player)
+          if (maxInPlayer >= 0) {
+            highestQueuedChunkIndex = maxInPlayer
+          }
+        }
+        windowRefillTrigger.value += 1L
         syncFromPlayer()
         persistCurrentPositionNow()
       }
@@ -122,16 +170,21 @@ class AudiobookPlaybackController(
         if (playbackState == Player.STATE_READY) {
           _uiState.update { it.copy(isWaitingForBuffer = false) }
         }
-        if (playbackState == Player.STATE_ENDED && _uiState.value.isProgressiveActive) {
-          val curChap = _uiState.value.playlistChapters.firstOrNull()
-          val totalChunks = curChap?.totalChunks ?: 0
-          val player = activePlayer
-          val shouldWait = player == null || player.playWhenReady
-          if (shouldWait && totalChunks > 0 && progressiveChunks.size < totalChunks) {
-            _uiState.update { it.copy(isWaitingForBuffer = true) }
-          }
+        if (playbackState == Player.STATE_ENDED) {
+          handlePlayerEnded()
         }
         syncFromPlayer()
+      }
+
+      override fun onPositionDiscontinuity(
+        oldPosition: Player.PositionInfo,
+        newPosition: Player.PositionInfo,
+        reason: Int,
+      ) {
+        if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+          windowRefillTrigger.value += 1L
+          syncFromPlayer()
+        }
       }
 
       override fun onPlayerError(error: PlaybackException) {
@@ -146,21 +199,28 @@ class AudiobookPlaybackController(
     }
 
   init {
-    scope.launch(Dispatchers.IO) {
-      for (request in persistenceQueue) {
-        when (request) {
-          is PersistenceRequest.Save ->
-            runCatching {
-              repository.updatePlaybackPosition(
-                request.bookId,
-                request.chapterIndex,
-                request.positionMs,
-              )
-            }
-          is PersistenceRequest.Flush -> request.ack.complete(Unit)
+    activeWindowAheadMs =
+      if (DeviceCapabilityInspector.inspect(context.applicationContext).isConstrainedDevice) {
+        AudiobookMediaHelper.CONSTRAINED_AHEAD_WINDOW_DURATION_MS
+      } else {
+        AudiobookMediaHelper.DEFAULT_AHEAD_WINDOW_DURATION_MS
+      }
+    persistenceConsumerJob =
+      scope.launch(Dispatchers.IO) {
+        for (request in persistenceQueue) {
+          when (request) {
+            is PersistenceRequest.Save ->
+              runCatching {
+                repository.updatePlaybackPosition(
+                  request.bookId,
+                  request.chapterIndex,
+                  request.positionMs,
+                )
+              }
+            is PersistenceRequest.Flush -> request.ack.complete(Unit)
+          }
         }
       }
-    }
     injectedPlayer?.addListener(playerListener)
     if (injectedPlayer != null && injectedPlayer.mediaItemCount > 0) {
       syncFromPlayer()
@@ -231,9 +291,10 @@ class AudiobookPlaybackController(
     startChapterIndex: Int? = null,
     startPositionMs: Long? = null,
   ) {
-    val playableChapters = AudiobookMediaHelper.buildPlayableChapters(chapters)
+    val orderedChapters = chapters.sortedBy { it.chapterIndex }
+    val playableChapters = AudiobookMediaHelper.buildPlayableChapters(orderedChapters)
     val requestedIndex = startChapterIndex ?: book.lastPlayedChapterIndex
-    val requestedChapter = chapters.firstOrNull { it.chapterIndex == requestedIndex }
+    val requestedChapter = orderedChapters.firstOrNull { it.chapterIndex == requestedIndex }
     val requestedIsNotReady =
       requestedChapter != null &&
         (requestedChapter.audioStatus != AudioGenerationStatus.READY ||
@@ -244,8 +305,12 @@ class AudiobookPlaybackController(
         playProgressiveChapter(book.id, requestedChapter.chapterIndex, startPositionMs)
         return
       }
+      if (requestedChapter != null && startChapterIndex != null) {
+        openOrPlayChapterOnDemand(book.id, requestedChapter.chapterIndex, startPositionMs ?: 0L)
+        return
+      }
       if (playableChapters.isEmpty()) {
-        val fallbackProgressive = chapters.firstOrNull { it.generatedChunks > 0 }
+        val fallbackProgressive = orderedChapters.firstOrNull { it.generatedChunks > 0 }
         if (fallbackProgressive != null) {
           playProgressiveChapter(book.id, fallbackProgressive.chapterIndex, startPositionMs)
           return
@@ -257,24 +322,30 @@ class AudiobookPlaybackController(
       }
     }
 
+    autoAdvanceJob?.cancel()
+    isAutoAdvancing = false
+    progressivePlayJob?.cancel()
+    seekJob?.cancel()
     stopProgressiveObserver()
     persistCurrentPositionNow()
 
     val targetChapterIndex =
       startChapterIndex ?: book.lastPlayedChapterIndex ?: playableChapters.first().chapterIndex
+    val contiguousReady = extractContiguousReadyRun(orderedChapters, targetChapterIndex)
+      .ifEmpty { playableChapters }
     val startListIndex =
-      playableChapters.indexOfFirst { it.chapterIndex == targetChapterIndex }.let { idx ->
+      contiguousReady.indexOfFirst { it.chapterIndex == targetChapterIndex }.let { idx ->
         if (idx >= 0) idx else 0
       }
     val initialSeekMs =
       startPositionMs
-        ?: if (book.lastPlayedChapterIndex == playableChapters[startListIndex].chapterIndex) {
+        ?: if (book.lastPlayedChapterIndex == contiguousReady[startListIndex].chapterIndex) {
           book.lastPlayedPositionMs.coerceAtLeast(0L)
         } else {
           0L
         }
 
-    val mediaItems = AudiobookMediaHelper.buildMediaItems(book, playableChapters)
+    val mediaItems = AudiobookMediaHelper.buildMediaItems(book, contiguousReady)
     playStartRequestedNs = System.nanoTime()
 
     _uiState.update {
@@ -283,16 +354,18 @@ class AudiobookPlaybackController(
         activeBookTitle = book.title,
         activeAuthor = book.author,
         activeCoverPath = book.coverImagePath,
-        playlistChapters = playableChapters,
-        currentChapterIndex = playableChapters[startListIndex].chapterIndex,
-        currentChapterTitle = playableChapters[startListIndex].title,
+        playlistChapters = contiguousReady,
+        currentChapterIndex = contiguousReady[startListIndex].chapterIndex,
+        currentChapterTitle = contiguousReady[startListIndex].title,
         positionMs = initialSeekMs,
-        durationMs = playableChapters[startListIndex].audioDurationMs,
+        durationMs = contiguousReady[startListIndex].audioDurationMs,
         isProgressiveActive = false,
-        bufferedDurationMs = playableChapters[startListIndex].audioDurationMs,
+        bufferedDurationMs = contiguousReady[startListIndex].audioDurationMs,
         aheadBufferedDurationMs =
-          (playableChapters[startListIndex].audioDurationMs - initialSeekMs).coerceAtLeast(0L),
+          (contiguousReady[startListIndex].audioDurationMs - initialSeekMs).coerceAtLeast(0L),
         isWaitingForBuffer = false,
+        activeWindowSize = mediaItems.size,
+        releasedChunksCount = 0,
         errorMessage = null,
       )
     }
@@ -321,7 +394,10 @@ class AudiobookPlaybackController(
     chapterIndex: Int,
     startPositionMs: Long? = null,
   ) {
+    autoAdvanceJob?.cancel()
+    isAutoAdvancing = false
     progressivePlayJob?.cancel()
+    seekJob?.cancel()
     stopProgressiveObserver()
     persistCurrentPositionNow()
     playStartRequestedNs = System.nanoTime()
@@ -340,10 +416,11 @@ class AudiobookPlaybackController(
         val book = loaded.book
         val chapter = chapterWithChunks.first
         val contiguousChunks =
-          AudiobookMediaHelper.extractContiguousValidChunks(chapterWithChunks.second)
+          AudiobookMediaHelper.extractContiguousValidChunks(
+            chapterWithChunks.second.filter { it.voiceName == book.selectedVoice.name }
+          )
 
         if (contiguousChunks.isEmpty()) {
-          // Si ya está listo como capítulo completo, usar playBook normal.
           if (chapter.audioStatus == AudioGenerationStatus.READY && !chapter.audioFilePath.isNullOrBlank()) {
             playBook(book, loaded.chapters, startChapterIndex = chapterIndex, startPositionMs = startPositionMs)
             return@launch
@@ -354,18 +431,36 @@ class AudiobookPlaybackController(
           return@launch
         }
 
-        progressiveChunks = contiguousChunks
-        lastQueuedChunkIndex = contiguousChunks.last().chunkIndex
         val bufferedMs = contiguousChunks.sumOf { it.durationMs.coerceAtLeast(0L) }
         val targetChapterPosMs =
           (startPositionMs
             ?: if (book.lastPlayedChapterIndex == chapterIndex) book.lastPlayedPositionMs else 0L)
             .coerceIn(0L, bufferedMs.coerceAtLeast(0L))
 
-        val (startChunkListIdx, offsetInChunkMs) =
+        val offsetsByChunk = AudiobookMediaHelper.computeChunkStartOffsetsMs(contiguousChunks)
+        val (targetListIdx, offsetInChunkMs) =
           AudiobookMediaHelper.resolveChunkPositionOffset(contiguousChunks, targetChapterPosMs)
+        val targetChunkIndex = contiguousChunks[targetListIdx].chunkIndex
+        val windowChunks =
+          AudiobookMediaHelper.selectSlidingWindowChunks(
+            contiguousChunks = contiguousChunks,
+            startChunkIndex = targetChunkIndex,
+            aheadWindowDurationMs = activeWindowAheadMs,
+          )
         val initialMediaItems =
-          AudiobookMediaHelper.buildProgressiveMediaItems(book, chapter, contiguousChunks)
+          AudiobookMediaHelper.buildProgressiveMediaItems(
+            book = book,
+            chapter = chapter,
+            chunks = windowChunks,
+            startOffsetsByChunkIndex = offsetsByChunk,
+          )
+        val startWindowIndex =
+          windowChunks.indexOfFirst { it.chunkIndex == targetChunkIndex }.coerceAtLeast(0)
+
+        progressiveChapterDurationMs = bufferedMs.coerceAtLeast(chapter.audioDurationMs)
+        progressiveTotalChunksCount = chapter.totalChunks.coerceAtLeast(contiguousChunks.size)
+        highestQueuedChunkIndex = windowChunks.last().chunkIndex
+        releasedChunkIndices.clear()
 
         _uiState.update {
           it.copy(
@@ -377,17 +472,19 @@ class AudiobookPlaybackController(
             currentChapterIndex = chapter.chapterIndex,
             currentChapterTitle = chapter.title,
             positionMs = targetChapterPosMs,
-            durationMs = bufferedMs.coerceAtLeast(chapter.audioDurationMs),
+            durationMs = progressiveChapterDurationMs,
             isProgressiveActive = true,
             bufferedDurationMs = bufferedMs,
             aheadBufferedDurationMs = (bufferedMs - targetChapterPosMs).coerceAtLeast(0L),
             isWaitingForBuffer = false,
+            activeWindowSize = initialMediaItems.size,
+            releasedChunksCount = 0,
             errorMessage = null,
           )
         }
 
         val execute: (Player) -> Unit = { player ->
-          player.setMediaItems(initialMediaItems, startChunkListIdx, offsetInChunkMs)
+          player.setMediaItems(initialMediaItems, startWindowIndex, offsetInChunkMs)
           if (player.isCommandAvailable(Player.COMMAND_SET_SPEED_AND_PITCH)) {
             player.setPlaybackSpeed(_uiState.value.playbackSpeed)
           }
@@ -408,71 +505,193 @@ class AudiobookPlaybackController(
   }
 
   private fun observeLiveProgressiveChunks(book: Book, chapter: Chapter) {
+    val bookId = book.id
+    val chapterId = chapter.id
+    val chapterIndex = chapter.chapterIndex
+    val voiceName = book.selectedVoice.name
+
     progressiveObserverJob?.cancel()
     progressiveObserverJob =
       scope.launch {
-        repository.observeChunksForChapter(chapter.id).collect { latestChunks ->
-          val player = activePlayer ?: return@collect
-          val state = _uiState.value
-          if (!state.isProgressiveActive ||
-            state.activeBookId != book.id ||
-            state.currentChapterIndex != chapter.chapterIndex
-          ) {
-            return@collect
-          }
-
-          val validContiguous =
-            AudiobookMediaHelper.extractContiguousValidChunks(
-              latestChunks.filter { it.voiceName == book.selectedVoice.name }
-            )
-          if (validContiguous.isEmpty()) return@collect
-
-          val existingIds =
-            (0 until player.mediaItemCount).mapTo(HashSet()) { idx ->
-              player.getMediaItemAt(idx).mediaId
-            }
-          val newlyReady =
-            validContiguous.filter { chunk ->
-              val expectedId = "${book.id}:${chapter.chapterIndex}:chunk:${chunk.chunkIndex}"
-              !existingIds.contains(expectedId)
+        var cachedChapter = chapter
+        var lastObservedChunkCount = -1
+        combine(
+          repository.observeChunksForChapter(chapterId),
+          windowRefillTrigger,
+        ) { latestChunks, _ -> latestChunks }
+          .collect { latestChunks ->
+            if (!coroutineContext.isActive) return@collect
+            val player = activePlayer ?: return@collect
+            val state = _uiState.value
+            if (!state.isProgressiveActive ||
+              state.activeBookId != bookId ||
+              state.currentChapterIndex != chapterIndex
+            ) {
+              return@collect
             }
 
-          val previousCount = player.mediaItemCount
-          if (newlyReady.isNotEmpty()) {
-            val newMediaItems =
-              AudiobookMediaHelper.buildProgressiveMediaItems(book, chapter, newlyReady)
-            // Añadir al final en tiempo real sin reiniciar ni interrumpir la reproducción activa.
-            player.addMediaItems(newMediaItems)
-          }
-
-          val newChunksArrived =
-            newlyReady.isNotEmpty() ||
-              validContiguous.size > progressiveChunks.size ||
-              player.mediaItemCount > previousCount
-          if (newChunksArrived) {
-            progressiveChunks = validContiguous
-            lastQueuedChunkIndex = validContiguous.last().chunkIndex
-
-            val newBufferedMs = validContiguous.sumOf { it.durationMs.coerceAtLeast(0L) }
-            val wasWaiting = _uiState.value.isWaitingForBuffer
-            _uiState.update {
-              it.copy(
-                bufferedDurationMs = newBufferedMs,
-                durationMs = newBufferedMs.coerceAtLeast(it.durationMs),
-                aheadBufferedDurationMs = (newBufferedMs - it.positionMs).coerceAtLeast(0L),
-                isWaitingForBuffer = false,
+            val validContiguous =
+              AudiobookMediaHelper.extractContiguousValidChunks(
+                latestChunks.filter { it.voiceName == voiceName }
               )
-            }
-            if (wasWaiting || (player.playbackState == Player.STATE_ENDED && player.playWhenReady)) {
-              if (previousCount < player.mediaItemCount) {
-                player.seekTo(previousCount, 0L)
-                player.prepare()
-                player.play()
+            if (validContiguous.isEmpty()) return@collect
+
+            val refreshedChapter =
+              if (latestChunks.size != lastObservedChunkCount) {
+                lastObservedChunkCount = latestChunks.size
+                withDbIo {
+                  repository.getChapterWithChunksOnce(bookId, chapterIndex)?.first
+                }?.also { cachedChapter = it } ?: cachedChapter
+              } else {
+                cachedChapter
+              }
+            progressiveTotalChunksCount =
+              maxOf(progressiveTotalChunksCount, refreshedChapter.totalChunks, latestChunks.size)
+            val newBufferedMs = validContiguous.sumOf { it.durationMs.coerceAtLeast(0L) }
+            progressiveChapterDurationMs =
+              maxOf(progressiveChapterDurationMs, newBufferedMs, refreshedChapter.audioDurationMs)
+
+            if (ownsPlayerDirectly) {
+              val offsetsByChunk = AudiobookMediaHelper.computeChunkStartOffsetsMs(validContiguous)
+              val maxQueuedInPlayer = AudiobookMediaHelper.maxChunkIndexInPlayer(player)
+              val tailChunkIdx =
+                if (player.mediaItemCount > 0 && maxQueuedInPlayer >= 0) maxQueuedInPlayer
+                else highestQueuedChunkIndex
+
+              val candidates = validContiguous.filter { it.chunkIndex > tailChunkIdx }
+              if (candidates.isNotEmpty()) {
+                var currentAheadMs = AudiobookMediaHelper.computeWindowAheadDurationMs(player)
+                val chunksToAppend = ArrayList<ChapterChunk>(4)
+                for (chunk in candidates) {
+                  val projectedCount = player.mediaItemCount + chunksToAppend.size
+                  if (projectedCount >= 2 && currentAheadMs >= activeWindowAheadMs) {
+                    break
+                  }
+                  chunksToAppend += chunk
+                  currentAheadMs += chunk.durationMs.coerceAtLeast(0L)
+                }
+
+                if (chunksToAppend.isNotEmpty()) {
+                  val previousCount = player.mediaItemCount
+                  val newMediaItems =
+                    AudiobookMediaHelper.buildProgressiveMediaItems(
+                      book = book,
+                      chapter = refreshedChapter,
+                      chunks = chunksToAppend,
+                      startOffsetsByChunkIndex = offsetsByChunk,
+                    )
+                  player.addMediaItems(newMediaItems)
+                  highestQueuedChunkIndex = chunksToAppend.last().chunkIndex
+
+                  val wasWaiting = _uiState.value.isWaitingForBuffer
+                  if (wasWaiting || (player.playbackState == Player.STATE_ENDED && player.playWhenReady)) {
+                    if (previousCount < player.mediaItemCount) {
+                      player.seekTo(previousCount, 0L)
+                      player.prepare()
+                      player.play()
+                    }
+                  }
+                }
               }
             }
+
+            val currentPos = AudiobookMediaHelper.resolveProgressiveChapterPositionMs(player)
+            _uiState.update {
+              it.copy(
+                playlistChapters = listOf(refreshedChapter),
+                bufferedDurationMs = newBufferedMs,
+                durationMs = maxOf(newBufferedMs, progressiveChapterDurationMs, it.durationMs),
+                aheadBufferedDurationMs = (newBufferedMs - currentPos).coerceAtLeast(0L),
+                isWaitingForBuffer =
+                  it.isWaitingForBuffer &&
+                    (player.playbackState == Player.STATE_ENDED &&
+                      AudiobookMediaHelper.maxChunkIndexInPlayer(player) >= highestQueuedChunkIndex),
+                activeWindowSize = player.mediaItemCount,
+                releasedChunksCount = computeReleasedChunksCount(player),
+              )
+            }
           }
+      }
+  }
+
+  private fun prunePlayedMediaItemsIfNeeded(player: Player, reason: Int) {
+    val currentExtras = player.currentMediaItem?.mediaMetadata?.extras
+    val isProgressive =
+      currentExtras?.getBoolean(AudiobookMediaHelper.EXTRA_IS_PROGRESSIVE_CHUNK, false) == true
+    if (!isProgressive) return
+    if (!player.isCommandAvailable(Player.COMMAND_CHANGE_MEDIA_ITEMS)) return
+
+    val currentIdx = player.currentMediaItemIndex
+    val pruneCount =
+      if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO) {
+        currentIdx
+      } else {
+        currentIdx - 1
+      }
+    if (pruneCount > 0 && pruneCount < player.mediaItemCount) {
+      for (i in 0 until pruneCount) {
+        val prunedChunkIdx =
+          player.getMediaItemAt(i).mediaMetadata.extras?.getInt(
+            AudiobookMediaHelper.EXTRA_CHUNK_INDEX,
+            -1,
+          ) ?: -1
+        if (prunedChunkIdx >= 0) {
+          releasedChunkIndices.add(prunedChunkIdx)
         }
       }
+      runCatching { player.removeMediaItems(0, pruneCount) }
+    }
+  }
+
+  private fun computeReleasedChunksCount(player: Player): Int {
+    if (ownsPlayerDirectly) return releasedChunkIndices.size
+    if (player.mediaItemCount == 0) return releasedChunkIndices.size
+    val firstChunkInWindow =
+      player.getMediaItemAt(0).mediaMetadata.extras?.getInt(
+        AudiobookMediaHelper.EXTRA_CHUNK_INDEX,
+        -1,
+      ) ?: -1
+    return maxOf(releasedChunkIndices.size, firstChunkInWindow.coerceAtLeast(0))
+  }
+
+  private fun handlePlayerEnded() {
+    val player = activePlayer ?: return
+    val state = _uiState.value
+    val extras = player.currentMediaItem?.mediaMetadata?.extras
+    val bookId =
+      extras?.getString(AudiobookMediaHelper.EXTRA_BOOK_ID)?.takeIf { it.isNotBlank() }
+        ?: state.activeBookId
+        ?: return
+    val chapterIndex =
+      extras?.getInt(AudiobookMediaHelper.EXTRA_CHAPTER_INDEX, -1)?.takeIf { it >= 0 }
+        ?: state.currentChapterIndex
+        ?: return
+    val isProgressive =
+      extras?.getBoolean(AudiobookMediaHelper.EXTRA_IS_PROGRESSIVE_CHUNK, false)
+        ?: state.isProgressiveActive
+
+    if (isProgressive) {
+      val maxQueued =
+        maxOf(highestQueuedChunkIndex, AudiobookMediaHelper.maxChunkIndexInPlayer(player))
+      val totalChunks =
+        progressiveTotalChunksCount.takeIf { it > 0 }
+          ?: state.playlistChapters.firstOrNull()?.totalChunks
+          ?: 0
+      val hasRemainingChunksInChapter = totalChunks <= 0 || maxQueued < totalChunks - 1
+      if (hasRemainingChunksInChapter) {
+        if (player.playWhenReady) {
+          _uiState.update { it.copy(isWaitingForBuffer = true) }
+          windowRefillTrigger.value += 1L
+        }
+        return
+      }
+    } else if (player.hasNextMediaItem()) {
+      return
+    }
+
+    if (ownsPlayerDirectly && player.playWhenReady) {
+      autoAdvanceToAdjacentChapter(bookId, chapterIndex, delta = 1)
+    }
   }
 
   fun togglePlayPause() {
@@ -525,18 +744,68 @@ class AudiobookPlaybackController(
   fun seekTo(positionMs: Long) {
     val player = activePlayer ?: return
     val state = _uiState.value
-    if (state.isProgressiveActive && progressiveChunks.isNotEmpty()) {
-      val maxBuffered = progressiveChunks.sumOf { it.durationMs.coerceAtLeast(0L) }
+    if (state.isProgressiveActive) {
+      val maxBuffered =
+        maxOf(state.bufferedDurationMs, progressiveChapterDurationMs, state.positionMs)
       val clamped = positionMs.coerceIn(0L, maxBuffered.coerceAtLeast(0L))
-      val (chunkIdx, localOffset) =
-        AudiobookMediaHelper.resolveChunkPositionOffset(progressiveChunks, clamped)
-      player.seekTo(chunkIdx.coerceIn(0, (player.mediaItemCount - 1).coerceAtLeast(0)), localOffset)
-    } else {
-      val maxDuration =
-        player.duration.takeIf { it > 0L } ?: state.durationMs.coerceAtLeast(0L)
-      val clamped = positionMs.coerceIn(0L, maxDuration)
-      player.seekTo(clamped)
+      val inWindowTarget = AudiobookMediaHelper.findWindowSeekTarget(player, clamped)
+      if (inWindowTarget != null) {
+        player.seekTo(inWindowTarget.first, inWindowTarget.second)
+        syncFromPlayer()
+        persistCurrentPositionNow()
+        return
+      }
+
+      val bookId = state.activeBookId ?: return
+      val chapIdx = state.currentChapterIndex ?: return
+      val shouldResumePlayback = state.isPlaying || player.playWhenReady
+      seekJob?.cancel()
+      seekJob =
+        scope.launch {
+          val loaded = repository.getBookWithChaptersOnce(bookId) ?: return@launch
+          val chapterWithChunks = repository.getChapterWithChunksOnce(bookId, chapIdx) ?: return@launch
+          val valid =
+            AudiobookMediaHelper.extractContiguousValidChunks(
+              chapterWithChunks.second.filter { it.voiceName == loaded.book.selectedVoice.name }
+            )
+          if (valid.isEmpty()) return@launch
+
+          val validTotalMs = valid.sumOf { it.durationMs.coerceAtLeast(0L) }
+          val clampedToDisk = clamped.coerceIn(0L, validTotalMs.coerceAtLeast(0L))
+          val offsets = AudiobookMediaHelper.computeChunkStartOffsetsMs(valid)
+          val (targetListIdx, localOffset) =
+            AudiobookMediaHelper.resolveChunkPositionOffset(valid, clampedToDisk)
+          val targetChunkIdx = valid[targetListIdx].chunkIndex
+          val windowChunks =
+            AudiobookMediaHelper.selectSlidingWindowChunks(
+              contiguousChunks = valid,
+              startChunkIndex = targetChunkIdx,
+              aheadWindowDurationMs = activeWindowAheadMs,
+            )
+          releasedChunkIndices.clear()
+          highestQueuedChunkIndex = windowChunks.last().chunkIndex
+          val mediaItems =
+            AudiobookMediaHelper.buildProgressiveMediaItems(
+              book = loaded.book,
+              chapter = chapterWithChunks.first,
+              chunks = windowChunks,
+              startOffsetsByChunkIndex = offsets,
+            )
+          player.setMediaItems(mediaItems, 0, localOffset)
+          player.prepare()
+          if (shouldResumePlayback) {
+            player.play()
+          }
+          syncFromPlayer()
+          persistCurrentPositionNow()
+        }
+      return
     }
+
+    val maxDuration =
+      player.duration.takeIf { it > 0L } ?: state.durationMs.coerceAtLeast(0L)
+    val clamped = positionMs.coerceIn(0L, maxDuration)
+    player.seekTo(clamped)
     syncFromPlayer()
     persistCurrentPositionNow()
   }
@@ -544,15 +813,10 @@ class AudiobookPlaybackController(
   fun seekForward(deltaMs: Long = 15_000L) {
     val player = activePlayer ?: return
     val state = _uiState.value
-    if (state.isProgressiveActive && progressiveChunks.isNotEmpty()) {
-      val maxDuration = progressiveChunks.sumOf { it.durationMs.coerceAtLeast(0L) }
-      val currentCumulative =
-        AudiobookMediaHelper.cumulativeChapterPositionMs(
-          progressiveChunks,
-          player.currentMediaItemIndex,
-          player.currentPosition,
-        )
-      seekTo((currentCumulative + deltaMs).coerceAtMost(maxDuration))
+    if (state.isProgressiveActive) {
+      val maxDuration = maxOf(state.bufferedDurationMs, progressiveChapterDurationMs, state.durationMs)
+      val currentCumulative = AudiobookMediaHelper.resolveProgressiveChapterPositionMs(player)
+      seekTo((currentCumulative + deltaMs).coerceAtMost(maxDuration.coerceAtLeast(currentCumulative)))
       return
     }
     val maxDuration =
@@ -565,13 +829,8 @@ class AudiobookPlaybackController(
 
   fun seekBack(deltaMs: Long = 15_000L) {
     val player = activePlayer ?: return
-    if (_uiState.value.isProgressiveActive && progressiveChunks.isNotEmpty()) {
-      val currentCumulative =
-        AudiobookMediaHelper.cumulativeChapterPositionMs(
-          progressiveChunks,
-          player.currentMediaItemIndex,
-          player.currentPosition,
-        )
+    if (_uiState.value.isProgressiveActive) {
+      val currentCumulative = AudiobookMediaHelper.resolveProgressiveChapterPositionMs(player)
       seekTo((currentCumulative - deltaMs).coerceAtLeast(0L))
       return
     }
@@ -583,59 +842,232 @@ class AudiobookPlaybackController(
 
   fun nextChapter() {
     val player = activePlayer ?: return
-    if (_uiState.value.isProgressiveActive) return
-    if (player.hasNextMediaItem()) {
+    val state = _uiState.value
+    if (!state.isProgressiveActive && player.hasNextMediaItem()) {
       player.seekToNextMediaItem()
       player.play()
       syncFromPlayer()
       persistCurrentPositionNow()
+      return
     }
+    val bookId = state.activeBookId ?: return
+    val currentChapIdx = state.currentChapterIndex ?: return
+    autoAdvanceToAdjacentChapter(bookId, currentChapIdx, delta = 1)
   }
 
   fun previousChapter() {
     val player = activePlayer ?: return
-    if (_uiState.value.isProgressiveActive) {
+    val state = _uiState.value
+    val currentPos =
+      if (state.isProgressiveActive) {
+        AudiobookMediaHelper.resolveProgressiveChapterPositionMs(player)
+      } else {
+        player.currentPosition.coerceAtLeast(0L)
+      }
+    if (currentPos > 5_000L) {
       seekTo(0L)
       return
     }
-    if (player.currentPosition > 5_000L || !player.hasPreviousMediaItem()) {
-      player.seekTo(0L)
-    } else {
+    if (!state.isProgressiveActive && player.hasPreviousMediaItem()) {
       player.seekToPreviousMediaItem()
+      syncFromPlayer()
+      persistCurrentPositionNow()
+      return
     }
-    syncFromPlayer()
-    persistCurrentPositionNow()
+    val bookId = state.activeBookId ?: return
+    val currentChapIdx = state.currentChapterIndex ?: return
+    scope.launch {
+      val prevChapter = repository.getAdjacentChapter(bookId, currentChapIdx, delta = -1)
+      if (prevChapter != null) {
+        openOrPlayChapterOnDemand(bookId, prevChapter.chapterIndex, startPositionMs = 0L)
+      } else {
+        seekTo(0L)
+      }
+    }
   }
 
   fun jumpToChapter(chapterIndex: Int) {
     val player = activePlayer ?: return
-    val list = _uiState.value.playlistChapters
+    val state = _uiState.value
+    val list = state.playlistChapters
     val idx = list.indexOfFirst { it.chapterIndex == chapterIndex }
-    if (idx >= 0) {
-      if (_uiState.value.isProgressiveActive) {
-        val currentChap = _uiState.value.currentChapterIndex
-        if (currentChap == chapterIndex) {
-          seekTo(0L)
-          return
-        }
-      }
-      if (player.mediaItemCount == 0 && _uiState.value.activeBookId != null) {
-        val bookId = _uiState.value.activeBookId!!
-        scope.launch {
-          val loaded = repository.getBookWithChaptersOnce(bookId) ?: return@launch
-          playBook(loaded.book, loaded.chapters, startChapterIndex = chapterIndex, startPositionMs = 0L)
-        }
-        return
-      }
+    if (!state.isProgressiveActive && idx >= 0 && player.mediaItemCount > idx) {
       player.seekTo(idx, 0L)
       player.play()
       syncFromPlayer()
       persistCurrentPositionNow()
+      return
+    }
+    if (state.currentChapterIndex == chapterIndex && player.mediaItemCount > 0) {
+      seekTo(0L)
+      if (!player.isPlaying) {
+        player.play()
+      }
+      return
+    }
+    val bookId = state.activeBookId ?: return
+    openOrPlayChapterOnDemand(bookId, chapterIndex, startPositionMs = 0L)
+  }
+
+  private fun autoAdvanceToAdjacentChapter(
+    bookId: String,
+    currentChapterIndex: Int,
+    delta: Int,
+  ) {
+    if (isAutoAdvancing) return
+    autoAdvanceJob?.cancel()
+    autoAdvanceJob =
+      scope.launch {
+        isAutoAdvancing = true
+        try {
+          val targetChapter =
+            repository.getAdjacentChapter(bookId, currentChapterIndex, delta = delta)
+              ?: return@launch
+          openOrPlayChapterOnDemandInternal(bookId, targetChapter.chapterIndex, startPositionMs = 0L)
+        } finally {
+          isAutoAdvancing = false
+        }
+      }
+  }
+
+  fun openOrPlayChapterOnDemand(
+    bookId: String,
+    chapterIndex: Int,
+    startPositionMs: Long = 0L,
+  ) {
+    autoAdvanceJob?.cancel()
+    autoAdvanceJob =
+      scope.launch {
+        isAutoAdvancing = true
+        try {
+          openOrPlayChapterOnDemandInternal(bookId, chapterIndex, startPositionMs)
+        } finally {
+          isAutoAdvancing = false
+        }
+      }
+  }
+
+  private suspend fun openOrPlayChapterOnDemandInternal(
+    bookId: String,
+    chapterIndex: Int,
+    startPositionMs: Long,
+  ) {
+    val loaded = repository.getBookWithChaptersOnce(bookId) ?: return
+    val targetChapter =
+      loaded.chapters.firstOrNull { it.chapterIndex == chapterIndex } ?: return
+    val book = loaded.book
+
+    stopProgressiveObserver()
+    repository.updatePlaybackPosition(bookId, chapterIndex, startPositionMs.coerceAtLeast(0L))
+
+    val isReadyWav =
+      targetChapter.audioStatus == AudioGenerationStatus.READY &&
+        !targetChapter.audioFilePath.isNullOrBlank() &&
+        WavAudioCodec.isValidWavFile(File(targetChapter.audioFilePath))
+    if (isReadyWav) {
+      playBook(book, loaded.chapters, startChapterIndex = chapterIndex, startPositionMs = startPositionMs)
+      return
+    }
+
+    val existingValid =
+      repository.getCompletedValidChunksOnce(targetChapter.id).filter {
+        it.voiceName == book.selectedVoice.name
+      }
+    if (existingValid.size >= 2) {
+      playProgressiveChapter(bookId, chapterIndex, startPositionMs)
+      repository.startOnDemandChapterLoading(bookId, chapterIndex)
+      return
+    }
+
+    _uiState.update {
+      it.copy(
+        activeBookId = book.id,
+        activeBookTitle = book.title,
+        activeAuthor = book.author,
+        activeCoverPath = book.coverImagePath,
+        playlistChapters = listOf(targetChapter),
+        currentChapterIndex = targetChapter.chapterIndex,
+        currentChapterTitle = targetChapter.title,
+        positionMs = startPositionMs,
+        durationMs = targetChapter.audioDurationMs,
+        isProgressiveActive = true,
+        bufferedDurationMs = existingValid.sumOf { ch -> ch.durationMs.coerceAtLeast(0L) },
+        aheadBufferedDurationMs = 0L,
+        isWaitingForBuffer = true,
+        activeWindowSize = 0,
+        releasedChunksCount = 0,
+        errorMessage = null,
+      )
+    }
+
+    repository.startOnDemandChapterLoading(bookId, chapterIndex)
+    var reachedReady = false
+    try {
+      val settled =
+        repository.progressiveChapterState.first { st ->
+          st != null &&
+            st.bookId == bookId &&
+            st.chapterIndex == chapterIndex &&
+            (st.phase == ProgressiveChapterPhase.RECOVERABLE_ERROR ||
+              st.phase == ProgressiveChapterPhase.PAUSED ||
+              st.canStartPlayback ||
+              st.isCompleteChapterReady)
+        }
+      if (settled != null &&
+        settled.phase != ProgressiveChapterPhase.RECOVERABLE_ERROR &&
+        settled.phase != ProgressiveChapterPhase.PAUSED
+      ) {
+        reachedReady = true
+        playProgressiveChapter(bookId, chapterIndex, startPositionMs)
+      } else {
+        _uiState.update {
+          it.copy(
+            isWaitingForBuffer = false,
+            errorMessage = settled?.errorMessage ?: it.errorMessage,
+          )
+        }
+      }
+    } finally {
+      if (!reachedReady) {
+        repository.setAwaitingPlaybackStart(bookId, chapterIndex, awaiting = false)
+      }
     }
   }
 
+  private fun extractContiguousReadyRun(
+    orderedChapters: List<Chapter>,
+    targetChapterIndex: Int,
+  ): List<Chapter> {
+    val targetPos = orderedChapters.indexOfFirst { it.chapterIndex == targetChapterIndex }
+    if (targetPos < 0) return emptyList()
+    var start = targetPos
+    while (start > 0 && isReadyWithValidWav(orderedChapters[start - 1])) {
+      start -= 1
+    }
+    var end = targetPos
+    while (end < orderedChapters.lastIndex && isReadyWithValidWav(orderedChapters[end + 1])) {
+      end += 1
+    }
+    val result = ArrayList<Chapter>(end - start + 1)
+    for (i in start..end) {
+      if (isReadyWithValidWav(orderedChapters[i])) {
+        result += orderedChapters[i]
+      }
+    }
+    return result
+  }
+
+  private fun isReadyWithValidWav(chapter: Chapter): Boolean =
+    chapter.audioStatus == AudioGenerationStatus.READY &&
+      !chapter.audioFilePath.isNullOrBlank() &&
+      WavAudioCodec.isValidWavFile(File(chapter.audioFilePath))
+
   fun stopIfBookCleared(bookId: String) {
     if (_uiState.value.activeBookId == bookId) {
+      autoAdvanceJob?.cancel()
+      isAutoAdvancing = false
+      progressivePlayJob?.cancel()
+      seekJob?.cancel()
       stopProgressiveObserver()
       activePlayer?.stop()
       activePlayer?.clearMediaItems()
@@ -649,15 +1081,17 @@ class AudiobookPlaybackController(
   }
 
   suspend fun awaitPersistenceForTesting() {
-    val ack = kotlinx.coroutines.CompletableDeferred<Unit>()
+    val ack = CompletableDeferred<Unit>()
     persistenceQueue.trySend(PersistenceRequest.Flush(ack))
     withContext(Dispatchers.Default) { ack.await() }
   }
 
   fun releaseForTesting() {
     stopPositionTicker()
-    stopProgressiveObserver()
+    autoAdvanceJob?.cancel()
     progressivePlayJob?.cancel()
+    seekJob?.cancel()
+    stopProgressiveObserver()
     activePlayer?.removeListener(playerListener)
     controllerFuture?.let { MediaController.releaseFuture(it) }
     controllerFuture = null
@@ -669,11 +1103,49 @@ class AudiobookPlaybackController(
     }
   }
 
+  private suspend fun <T> withDbIo(block: suspend () -> T): T {
+    activeIoQueries.incrementAndGet()
+    return withContext(Dispatchers.IO) {
+      try {
+        block()
+      } finally {
+        activeIoQueries.decrementAndGet()
+      }
+    }
+  }
+
+  suspend fun awaitAndReleaseForTesting() {
+    stopPositionTicker()
+    autoAdvanceJob?.cancel()
+    progressivePlayJob?.cancel()
+    seekJob?.cancel()
+    stopProgressiveObserver()
+    activePlayer?.removeListener(playerListener)
+    controllerFuture?.let { MediaController.releaseFuture(it) }
+    controllerFuture = null
+    activePlayer = null
+    persistenceQueue.close()
+    controllerJob.cancel()
+    withContext(Dispatchers.IO) {
+      persistenceConsumerJob?.join()
+      var waitedMs = 0L
+      while (activeIoQueries.get() > 0 && waitedMs < 2_000L) {
+        delay(5L)
+        waitedMs += 5L
+      }
+    }
+    if (INSTANCE === this) {
+      INSTANCE = null
+    }
+  }
+
   private fun stopProgressiveObserver() {
     progressiveObserverJob?.cancel()
     progressiveObserverJob = null
-    progressiveChunks = emptyList()
-    lastQueuedChunkIndex = -1
+    progressiveChapterDurationMs = 0L
+    progressiveTotalChunksCount = 0
+    highestQueuedChunkIndex = -1
+    releasedChunkIndices.clear()
   }
 
   private fun syncFromPlayer() {
@@ -691,7 +1163,9 @@ class AudiobookPlaybackController(
     if (
       playerBookId != null &&
         !itemIsProgressive &&
-        (state.activeBookId != playerBookId || state.playlistChapters.isEmpty()) &&
+        (state.activeBookId != playerBookId ||
+          state.isProgressiveActive ||
+          state.playlistChapters.isEmpty()) &&
         hydratingBookId != playerBookId
     ) {
       hydratingBookId = playerBookId
@@ -705,39 +1179,88 @@ class AudiobookPlaybackController(
               AudiobookMediaHelper.EXTRA_CHAPTER_INDEX,
               -1,
             )?.takeIf { it >= 0 } ?: itemChapterIndex
+          val contiguousRun =
+            currentChapIdx?.let { extractContiguousReadyRun(loaded.chapters.sortedBy { c -> c.chapterIndex }, it) }
+              ?.takeIf { it.isNotEmpty() }
+              ?: playable
           val matched =
-            playable.firstOrNull { it.chapterIndex == currentChapIdx }
-              ?: playable.getOrNull(activePlayer?.currentMediaItemIndex ?: 0)
+            contiguousRun.firstOrNull { it.chapterIndex == currentChapIdx }
+              ?: contiguousRun.getOrNull(activePlayer?.currentMediaItemIndex ?: 0)
           _uiState.update {
             it.copy(
               activeBookId = loaded.book.id,
               activeBookTitle = loaded.book.title,
               activeAuthor = loaded.book.author,
               activeCoverPath = loaded.book.coverImagePath,
-              playlistChapters = playable,
+              playlistChapters = contiguousRun,
+              isProgressiveActive = false,
               currentChapterIndex = matched?.chapterIndex ?: it.currentChapterIndex,
               currentChapterTitle = matched?.title ?: it.currentChapterTitle,
               durationMs =
                 (activePlayer?.duration?.takeIf { d -> d > 0L } ?: matched?.audioDurationMs ?: it.durationMs),
+              activeWindowSize = activePlayer?.mediaItemCount ?: 0,
+              releasedChunksCount = 0,
             )
           }
         }
       }
     }
 
+    if (playerBookId != null &&
+      itemIsProgressive &&
+      itemChapterIndex != null &&
+      (progressiveObserverJob?.isActive != true ||
+        state.activeBookId != playerBookId ||
+        state.currentChapterIndex != itemChapterIndex) &&
+      hydratingProgressiveKey != (playerBookId to itemChapterIndex)
+    ) {
+      val key = playerBookId to itemChapterIndex
+      hydratingProgressiveKey = key
+      scope.launch {
+        val loaded = repository.getBookWithChaptersOnce(playerBookId)
+        val chWithChunks = repository.getChapterWithChunksOnce(playerBookId, itemChapterIndex)
+        hydratingProgressiveKey = null
+        if (loaded != null && chWithChunks != null) {
+          val ch = chWithChunks.first
+          val validChunks =
+            AudiobookMediaHelper.extractContiguousValidChunks(
+              chWithChunks.second.filter { it.voiceName == loaded.book.selectedVoice.name }
+            )
+          val bufferedMs = validChunks.sumOf { it.durationMs.coerceAtLeast(0L) }
+          progressiveChapterDurationMs = maxOf(bufferedMs, ch.audioDurationMs)
+          progressiveTotalChunksCount = maxOf(ch.totalChunks, chWithChunks.second.size)
+          _uiState.update {
+            it.copy(
+              activeBookId = loaded.book.id,
+              activeBookTitle = loaded.book.title,
+              activeAuthor = loaded.book.author,
+              activeCoverPath = loaded.book.coverImagePath,
+              playlistChapters = listOf(ch),
+              currentChapterIndex = ch.chapterIndex,
+              currentChapterTitle = ch.title,
+              isProgressiveActive = true,
+              bufferedDurationMs = bufferedMs,
+              durationMs = maxOf(bufferedMs, ch.audioDurationMs),
+            )
+          }
+          if (progressiveObserverJob?.isActive != true ||
+            state.activeBookId != playerBookId ||
+            state.currentChapterIndex != itemChapterIndex
+          ) {
+            observeLiveProgressiveChunks(loaded.book, ch)
+          }
+        }
+      }
+    }
+
     if (player.mediaItemCount == 0 && state.hasActiveAudio) {
-      _uiState.update { it.copy(isPlaying = false) }
+      _uiState.update { it.copy(isPlaying = false, activeWindowSize = 0) }
       return
     }
 
-    if ((state.isProgressiveActive || itemIsProgressive) && progressiveChunks.isNotEmpty()) {
-      val cumulativePos =
-        AudiobookMediaHelper.cumulativeChapterPositionMs(
-          chunks = progressiveChunks,
-          currentItemIndex = player.currentMediaItemIndex,
-          currentLocalPosMs = player.currentPosition.coerceAtLeast(0L),
-        )
-      val bufferedMs = progressiveChunks.sumOf { it.durationMs.coerceAtLeast(0L) }
+    if (state.isProgressiveActive || itemIsProgressive) {
+      val cumulativePos = AudiobookMediaHelper.resolveProgressiveChapterPositionMs(player)
+      val bufferedMs = state.bufferedDurationMs.coerceAtLeast(cumulativePos)
       val aheadMs = (bufferedMs - cumulativePos).coerceAtLeast(0L)
       val resolvedChapIdx = itemChapterIndex ?: state.currentChapterIndex
       val resolvedBookId = playerBookId ?: state.activeBookId
@@ -747,15 +1270,17 @@ class AudiobookPlaybackController(
           activeBookId = resolvedBookId,
           currentChapterIndex = resolvedChapIdx,
           currentChapterTitle =
-            state.playlistChapters.firstOrNull()?.title
+            state.playlistChapters.firstOrNull { ch -> ch.chapterIndex == resolvedChapIdx }?.title
               ?: currentItem?.mediaMetadata?.title?.toString()
               ?: it.currentChapterTitle,
           isPlaying = player.isPlaying,
           positionMs = cumulativePos,
-          durationMs = bufferedMs.coerceAtLeast(it.durationMs),
+          durationMs = maxOf(bufferedMs, progressiveChapterDurationMs, it.durationMs),
           isProgressiveActive = true,
           bufferedDurationMs = bufferedMs,
           aheadBufferedDurationMs = aheadMs,
+          activeWindowSize = player.mediaItemCount,
+          releasedChunksCount = computeReleasedChunksCount(player),
         )
       }
 
@@ -788,10 +1313,13 @@ class AudiobookPlaybackController(
             ?: currentItem?.mediaMetadata?.title?.toString()
             ?: it.currentChapterTitle,
         isPlaying = player.isPlaying,
+        isProgressiveActive = false,
         positionMs = resolvedPos,
         durationMs = resolvedDuration,
         bufferedDurationMs = resolvedDuration,
         aheadBufferedDurationMs = (resolvedDuration - resolvedPos).coerceAtLeast(0L),
+        activeWindowSize = player.mediaItemCount,
+        releasedChunksCount = 0,
       )
     }
   }
@@ -817,6 +1345,9 @@ class AudiobookPlaybackController(
           } else {
             0L
           }
+        val contiguousRun =
+          extractContiguousReadyRun(last.chapters.sortedBy { it.chapterIndex }, readyMatched.chapterIndex)
+            .ifEmpty { playable }
         _uiState.update {
           if (it.hasActiveAudio || (activePlayer?.mediaItemCount ?: 0) > 0) {
             it
@@ -826,7 +1357,7 @@ class AudiobookPlaybackController(
               activeBookTitle = last.book.title,
               activeAuthor = last.book.author,
               activeCoverPath = last.book.coverImagePath,
-              playlistChapters = playable,
+              playlistChapters = contiguousRun,
               currentChapterIndex = readyMatched.chapterIndex,
               currentChapterTitle = readyMatched.title,
               isPlaying = false,
@@ -841,17 +1372,20 @@ class AudiobookPlaybackController(
         return@launch
       }
 
-      // Intentar restaurar capítulo en progreso con fragmentos WAV válidos guardados en disco.
       val targetChapter =
         last.chapters.firstOrNull { it.chapterIndex == targetIndex }
           ?: playable.firstOrNull()
           ?: return@launch
-      val savedChunks = repository.getCompletedValidChunksOnce(targetChapter.id)
+      val savedChunks =
+        repository.getCompletedValidChunksOnce(targetChapter.id).filter {
+          it.voiceName == last.book.selectedVoice.name
+        }
       if (savedChunks.isEmpty()) return@launch
 
       val bufferedMs = savedChunks.sumOf { it.durationMs.coerceAtLeast(0L) }
       val savedPos = last.book.lastPlayedPositionMs.coerceIn(0L, bufferedMs.coerceAtLeast(0L))
-      progressiveChunks = savedChunks
+      progressiveChapterDurationMs = bufferedMs.coerceAtLeast(targetChapter.audioDurationMs)
+      progressiveTotalChunksCount = targetChapter.totalChunks.coerceAtLeast(savedChunks.size)
       _uiState.update {
         if (it.hasActiveAudio || (activePlayer?.mediaItemCount ?: 0) > 0) {
           it
@@ -866,7 +1400,7 @@ class AudiobookPlaybackController(
             currentChapterTitle = targetChapter.title,
             isPlaying = false,
             positionMs = savedPos,
-            durationMs = bufferedMs.coerceAtLeast(targetChapter.audioDurationMs),
+            durationMs = progressiveChapterDurationMs,
             isProgressiveActive = true,
             bufferedDurationMs = bufferedMs,
             aheadBufferedDurationMs = (bufferedMs - savedPos).coerceAtLeast(0L),
@@ -901,15 +1435,12 @@ class AudiobookPlaybackController(
     val current = _uiState.value
     val bookId = current.activeBookId ?: return
     val chapterIndex = current.currentChapterIndex ?: return
+    val player = activePlayer
     val pos =
-      if (current.isProgressiveActive && progressiveChunks.isNotEmpty() && activePlayer != null) {
-        AudiobookMediaHelper.cumulativeChapterPositionMs(
-          chunks = progressiveChunks,
-          currentItemIndex = activePlayer?.currentMediaItemIndex ?: 0,
-          currentLocalPosMs = activePlayer?.currentPosition?.coerceAtLeast(0L) ?: 0L,
-        )
+      if (current.isProgressiveActive && player != null && player.mediaItemCount > 0) {
+        AudiobookMediaHelper.resolveProgressiveChapterPositionMs(player)
       } else {
-        activePlayer?.currentPosition?.coerceAtLeast(0L) ?: current.positionMs
+        player?.currentPosition?.coerceAtLeast(0L) ?: current.positionMs
       }
     persistenceQueue.trySend(PersistenceRequest.Save(bookId, chapterIndex, pos))
   }

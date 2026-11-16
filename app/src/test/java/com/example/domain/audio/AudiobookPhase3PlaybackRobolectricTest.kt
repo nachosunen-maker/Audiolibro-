@@ -68,6 +68,10 @@ class AudiobookPhase3PlaybackRobolectricTest {
   private lateinit var db: AppDatabase
   private lateinit var storageManager: AudiobookStorageManager
   private lateinit var repository: AudiobookRepository
+  private val trackedControllers = mutableListOf<AudiobookPlaybackController>()
+
+  private fun trackController(controller: AudiobookPlaybackController): AudiobookPlaybackController =
+    controller.also { trackedControllers += it }
 
   @Before
   fun setUp() {
@@ -81,7 +85,11 @@ class AudiobookPhase3PlaybackRobolectricTest {
 
   @After
   fun tearDown() {
-    runBlocking { repository.awaitAndCloseForTesting() }
+    runBlocking {
+      trackedControllers.forEach { it.awaitAndReleaseForTesting() }
+      trackedControllers.clear()
+      repository.awaitAndCloseForTesting()
+    }
     storageManager.deleteBookAudioFiles("book-p3-1")
     storageManager.deleteBookAudioFiles("book-p3-2")
     File(context.filesDir, "covers").deleteRecursively()
@@ -223,7 +231,7 @@ class AudiobookPhase3PlaybackRobolectricTest {
         insertBookWithReadyWavChapters(dao, "book-p3-2", null, title = "Segundo Libro")
 
       val testPlayer = InMemoryPlaylistPlayer()
-      val controller = AudiobookPlaybackController(context, repository, injectedPlayer = testPlayer)
+      val controller = trackController(AudiobookPlaybackController(context, repository, injectedPlayer = testPlayer))
       try {
         controller.playBook(book1, chapters1, startChapterIndex = 1, startPositionMs = 450L)
         awaitCondition {
@@ -253,7 +261,7 @@ class AudiobookPhase3PlaybackRobolectricTest {
 
         awaitCondition { dao.getBookOnce("book-p3-1")?.lastPlayedChapterIndex == 1 }
       } finally {
-        controller.releaseForTesting()
+        controller.awaitAndReleaseForTesting()
         testPlayer.release()
       }
 
@@ -446,11 +454,12 @@ class AudiobookPhase3PlaybackRobolectricTest {
             (savedBook?.lastPlayedPositionMs ?: 0L) >= info0.durationMs + 250L,
           )
 
-          // Resumption reconstructs chunk playlist at chunk index 1 and offset >= 250ms.
+          // Resumption reconstructs sliding window starting at chunk 1 (skipping already played chunk 0) and offset >= 250ms.
           val resumption =
             awaitFuture(service.triggerPlaybackResumptionForTesting(createTestControllerInfo()))
-          assertEquals(2, resumption.mediaItems.size)
-          assertEquals(1, resumption.startIndex)
+          assertEquals(1, resumption.mediaItems.size)
+          assertEquals(0, resumption.startIndex)
+          assertEquals("$bookId:1:chunk:1", resumption.mediaItems[resumption.startIndex].mediaId)
           assertTrue(resumption.startPositionMs >= 250L)
         } finally {
           serviceController.destroy()
@@ -475,7 +484,7 @@ class AudiobookPhase3PlaybackRobolectricTest {
       existingPlayer.play()
 
       val reconnectedController =
-        AudiobookPlaybackController(context, repository, injectedPlayer = existingPlayer)
+        trackController(AudiobookPlaybackController(context, repository, injectedPlayer = existingPlayer))
       try {
         awaitCondition {
           val st = reconnectedController.uiState.value
@@ -503,7 +512,7 @@ class AudiobookPhase3PlaybackRobolectricTest {
         assertEquals(2, recreatedVm.playbackState.value.currentChapterIndex)
         assertEquals(900L, recreatedVm.playbackState.value.positionMs)
       } finally {
-        reconnectedController.releaseForTesting()
+        reconnectedController.awaitAndReleaseForTesting()
         existingPlayer.release()
       }
 
@@ -511,7 +520,7 @@ class AudiobookPhase3PlaybackRobolectricTest {
       repository.updatePlaybackPosition("book-p3-1", 2, 1250L)
       val idlePlayer = InMemoryPlaylistPlayer()
       val coldController =
-        AudiobookPlaybackController(context, repository, injectedPlayer = idlePlayer)
+        trackController(AudiobookPlaybackController(context, repository, injectedPlayer = idlePlayer))
       try {
         coldController.restoreLastPlaybackIfIdle()
         awaitCondition {
@@ -523,7 +532,7 @@ class AudiobookPhase3PlaybackRobolectricTest {
         assertEquals(1250L, restored.positionMs)
         assertFalse(restored.isPlaying)
       } finally {
-        coldController.releaseForTesting()
+        coldController.awaitAndReleaseForTesting()
         idlePlayer.release()
       }
     }
@@ -552,7 +561,7 @@ class AudiobookPhase3PlaybackRobolectricTest {
       activityController.pause().stop().destroy()
       Shadows.shadowOf(Looper.getMainLooper()).idle()
     } finally {
-      AudiobookPlaybackController.getInstance(context).releaseForTesting()
+      runBlocking { AudiobookPlaybackController.getInstance(context).awaitAndReleaseForTesting() }
       serviceController.destroy()
       Shadows.shadowOf(Looper.getMainLooper()).idle()
     }

@@ -71,9 +71,13 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
   private lateinit var db: AppDatabase
   private lateinit var storageManager: AudiobookStorageManager
   private val trackedRepos = mutableListOf<AudiobookRepository>()
+  private val trackedControllers = mutableListOf<AudiobookPlaybackController>()
 
   private fun trackRepo(repo: AudiobookRepository): AudiobookRepository =
     repo.also { trackedRepos += it }
+
+  private fun trackController(controller: AudiobookPlaybackController): AudiobookPlaybackController =
+    controller.also { trackedControllers += it }
 
   @Before
   fun setUp() {
@@ -87,6 +91,8 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
   @After
   fun tearDown() {
     runBlocking {
+      trackedControllers.forEach { it.awaitAndReleaseForTesting() }
+      trackedControllers.clear()
       trackedRepos.forEach { it.awaitAndCloseForTesting() }
       trackedRepos.clear()
     }
@@ -188,7 +194,7 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
           )
         )
       val testPlayer = InMemoryPlaylistPlayer()
-      val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
+      val controller = trackController(AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer))
 
       try {
         repo.startProgressiveChapterLoading("prog-book-1", chapterIndex = 4)
@@ -252,7 +258,7 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
         assertEquals(4, persistedBook.lastPlayedChapterIndex)
         assertTrue(persistedBook.lastPlayedPositionMs >= 9_000L)
       } finally {
-        controller.releaseForTesting()
+        controller.awaitAndReleaseForTesting()
         testPlayer.release()
       }
     }
@@ -499,7 +505,7 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
   }
 
   @Test
-  fun `ProgressiveChapterContent and BookDetailScreen UI expose Cargar capitulo real progress 5 states and reduced-motion tiers`() =
+  fun `ProgressiveChapterContent and BookDetailScreen UI expose Cargar capitulo real progress 5 states and reduced-motion tiers`(): Unit =
     runBlocking {
       val dao = db.audiobookDao()
       dao.insertBookWithChapters(
@@ -537,28 +543,31 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
 
       val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager))
       val testPlayer = InMemoryPlaylistPlayer()
-      val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
+      val controller = trackController(AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer))
       val detailVm = BookDetailViewModel("prog-book-1", repo, controller)
 
-      composeRule.setContent {
-        AudiolibroTheme {
-          BookDetailScreen(
-            viewModel = detailVm,
-            onNavigateBack = {},
-            onOpenChapterText = { _, _ -> },
-            onLoadChapter = { _, _ -> },
-            onOpenPlayer = { _, _ -> },
-          )
+      try {
+        composeRule.setContent {
+          AudiolibroTheme {
+            BookDetailScreen(
+              viewModel = detailVm,
+              onNavigateBack = {},
+              onOpenChapterText = { _, _ -> },
+              onLoadChapter = { _, _ -> },
+              onOpenPlayer = { _, _ -> },
+            )
+          }
         }
-      }
 
-      composeRule.waitUntil(timeoutMillis = 5_000L) {
-        composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
+        composeRule.waitUntil(timeoutMillis = 5_000L) {
+          composeRule.onAllNodesWithTag("voice_male_card").fetchSemanticsNodes().isNotEmpty()
+        }
+        composeRule.onNode(hasScrollToNodeAction()).performScrollToNode(hasTestTag("load_chapter_3"))
+        composeRule.onNodeWithTag("load_chapter_3").assertIsDisplayed()
+      } finally {
+        controller.awaitAndReleaseForTesting()
+        testPlayer.release()
       }
-      composeRule.onNode(hasScrollToNodeAction()).performScrollToNode(hasTestTag("load_chapter_3"))
-      composeRule.onNodeWithTag("load_chapter_3").assertIsDisplayed()
-      controller.releaseForTesting()
-      testPlayer.release()
     }
 
   @Test
@@ -831,7 +840,7 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
 
       val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager, audioSynthesisProvider = unusedProvider))
       val testPlayer = InMemoryPlaylistPlayer()
-      val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
+      val controller = trackController(AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer))
 
       try {
         controller.playProgressiveChapter(bookId, chapterIndex = 1, startPositionMs = 0L)
@@ -867,7 +876,7 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
         assertEquals(Player.STATE_READY, testPlayer.playbackState)
         assertFalse(controller.uiState.value.isWaitingForBuffer)
       } finally {
-        controller.releaseForTesting()
+        controller.awaitAndReleaseForTesting()
         testPlayer.release()
       }
     }

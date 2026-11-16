@@ -11,7 +11,6 @@ import androidx.lifecycle.viewModelScope
 import androidx.lifecycle.viewmodel.CreationExtras
 import com.example.data.repository.AudiobookRepository
 import com.example.domain.audio.AudioSynthesisProvider
-import com.example.domain.audio.BookGenerationProgress
 import com.example.domain.audio.ProgressiveChapterState
 import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.Book
@@ -97,7 +96,6 @@ sealed interface BookDetailUiState {
   data class Loaded(
     val data: BookWithChapters,
     val audioStorageBytes: Long,
-    val generationProgress: BookGenerationProgress?,
     val generationTask: com.example.data.local.GenerationTaskEntity? = null,
   ) : BookDetailUiState
 
@@ -126,22 +124,16 @@ class BookDetailViewModel(
     combine(
         repository.observeBookWithChapters(bookId),
         _storageBytes,
-        repository.generationProgress.map { it[bookId] },
         repository.observeGenerationTask(bookId),
-      ) { bookWithChapters, storageBytes, progress, task ->
+      ) { bookWithChapters, storageBytes, task ->
         if (bookWithChapters == null) {
           BookDetailUiState.NotFound
         } else {
           val liveBytes =
-            if (progress?.isRunning == false) {
-              repository.getBookAudioStorageBytes(bookId)
-            } else {
-              storageBytes
-            }
+            repository.getBookAudioStorageBytes(bookId).coerceAtLeast(storageBytes)
           BookDetailUiState.Loaded(
             data = bookWithChapters,
             audioStorageBytes = liveBytes,
-            generationProgress = progress,
             generationTask = task,
           )
         }
@@ -158,25 +150,6 @@ class BookDetailViewModel(
 
   fun selectVoice(voice: NarratorVoice) {
     viewModelScope.launch { repository.updateSelectedVoice(bookId, voice) }
-  }
-
-  fun generateAudiobook() {
-    Log.i("BookDetailVM", "generateAudiobook() invocado para bookId=$bookId")
-    repository.requestAudiobookGeneration(bookId)
-  }
-
-  fun pauseGeneration() {
-    repository.pauseAudiobookGeneration(bookId)
-    refreshStorageBytes()
-  }
-
-  fun cancelGeneration() {
-    repository.cancelAudiobookGeneration(bookId)
-    refreshStorageBytes()
-  }
-
-  fun clearGenerationError() {
-    repository.clearGenerationError(bookId)
   }
 
   fun playChapter(chapterIndex: Int? = null) {
@@ -481,21 +454,13 @@ class PlayerViewModel(
 
   fun jumpToChapter(chapterIndex: Int) {
     val state = playbackController.uiState.value
-    if (state.activeBookId == bookId &&
-      !state.isProgressiveActive &&
-      playbackController.hasActiveMediaInPlayer() &&
-      state.playlistChapters.any { it.chapterIndex == chapterIndex }
-    ) {
+    viewModelScope.launch {
+      repository.hydrateProgressiveChapterPreview(bookId, chapterIndex)
+    }
+    if (state.activeBookId == bookId && playbackController.hasActiveMediaInPlayer()) {
       playbackController.jumpToChapter(chapterIndex)
     } else {
-      val data = bookWithChapters.value ?: return
-      val target = data.chapters.firstOrNull { it.chapterIndex == chapterIndex }
-      if (target != null && target.audioStatus != AudioGenerationStatus.READY && target.generatedChunks > 0) {
-        viewModelScope.launch { repository.hydrateProgressiveChapterPreview(bookId, chapterIndex) }
-        playbackController.playProgressiveChapter(bookId, chapterIndex, startPositionMs = 0L)
-      } else {
-        playbackController.playBook(data.book, data.chapters, startChapterIndex = chapterIndex, startPositionMs = 0L)
-      }
+      playbackController.openOrPlayChapterOnDemand(bookId, chapterIndex, startPositionMs = 0L)
     }
   }
 

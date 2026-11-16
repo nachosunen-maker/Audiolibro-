@@ -4,6 +4,7 @@ import android.net.Uri
 import android.os.Bundle
 import androidx.media3.common.MediaItem
 import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Player
 import com.example.domain.audio.WavAudioCodec
 import com.example.domain.model.AudioGenerationStatus
 import com.example.domain.model.Book
@@ -17,7 +18,11 @@ object AudiobookMediaHelper {
   const val EXTRA_CHAPTER_INDEX = "extra_chapter_index"
   const val EXTRA_CHUNK_INDEX = "extra_chunk_index"
   const val EXTRA_CHUNK_DURATION_MS = "extra_chunk_duration_ms"
+  const val EXTRA_CHUNK_START_OFFSET_MS = "extra_chunk_start_offset_ms"
   const val EXTRA_IS_PROGRESSIVE_CHUNK = "extra_is_progressive_chunk"
+
+  const val DEFAULT_AHEAD_WINDOW_DURATION_MS = 30_000L
+  const val CONSTRAINED_AHEAD_WINDOW_DURATION_MS = 20_000L
 
   fun buildPlayableChapters(chapters: List<Chapter>): List<Chapter> =
     chapters
@@ -41,6 +46,38 @@ object AudiobookMediaHelper {
       expectedIdx += 1
     }
     return contiguous
+  }
+
+  fun computeChunkStartOffsetsMs(contiguousChunks: List<ChapterChunk>): Map<Int, Long> {
+    val offsets = HashMap<Int, Long>(contiguousChunks.size)
+    var runningMs = 0L
+    for (chunk in contiguousChunks) {
+      offsets[chunk.chunkIndex] = runningMs
+      runningMs += chunk.durationMs.coerceAtLeast(0L)
+    }
+    return offsets
+  }
+
+  fun selectSlidingWindowChunks(
+    contiguousChunks: List<ChapterChunk>,
+    startChunkIndex: Int,
+    aheadWindowDurationMs: Long = DEFAULT_AHEAD_WINDOW_DURATION_MS,
+  ): List<ChapterChunk> {
+    val startPos = contiguousChunks.indexOfFirst { it.chunkIndex >= startChunkIndex }
+    if (startPos < 0) return emptyList()
+    val window = ArrayList<ChapterChunk>(8)
+    var accumulatedAheadMs = 0L
+    for (i in startPos until contiguousChunks.size) {
+      val chunk = contiguousChunks[i]
+      window += chunk
+      if (i > startPos) {
+        accumulatedAheadMs += chunk.durationMs.coerceAtLeast(0L)
+        if (window.size >= 2 && accumulatedAheadMs >= aheadWindowDurationMs) {
+          break
+        }
+      }
+    }
+    return window
   }
 
   fun buildMediaItems(book: Book, playableChapters: List<Chapter>): List<MediaItem> {
@@ -81,18 +118,21 @@ object AudiobookMediaHelper {
   fun buildProgressiveMediaItems(
     book: Book,
     chapter: Chapter,
-    contiguousChunks: List<ChapterChunk>,
+    chunks: List<ChapterChunk>,
+    startOffsetsByChunkIndex: Map<Int, Long> = computeChunkStartOffsetsMs(chunks),
   ): List<MediaItem> {
     val artworkUri =
       book.coverImagePath?.let { File(it) }?.takeIf { it.exists() }?.let { Uri.fromFile(it) }
 
-    return contiguousChunks.map { chunk ->
+    return chunks.map { chunk ->
+      val startOffsetMs = startOffsetsByChunkIndex[chunk.chunkIndex] ?: 0L
       val extras =
         Bundle().apply {
           putString(EXTRA_BOOK_ID, book.id)
           putInt(EXTRA_CHAPTER_INDEX, chapter.chapterIndex)
           putInt(EXTRA_CHUNK_INDEX, chunk.chunkIndex)
           putLong(EXTRA_CHUNK_DURATION_MS, chunk.durationMs.coerceAtLeast(0L))
+          putLong(EXTRA_CHUNK_START_OFFSET_MS, startOffsetMs.coerceAtLeast(0L))
           putBoolean(EXTRA_IS_PROGRESSIVE_CHUNK, true)
         }
       val metadata =
@@ -133,6 +173,76 @@ object AudiobookMediaHelper {
       remaining -= dur
     }
     return 0 to 0L
+  }
+
+  fun resolveProgressiveChapterPositionMs(player: Player): Long {
+    val currentItem = player.currentMediaItem ?: return player.currentPosition.coerceAtLeast(0L)
+    val extras = currentItem.mediaMetadata.extras ?: return player.currentPosition.coerceAtLeast(0L)
+    val chunkDur = extras.getLong(EXTRA_CHUNK_DURATION_MS, 0L)
+    val localPos =
+      if (chunkDur > 0L) player.currentPosition.coerceIn(0L, chunkDur)
+      else player.currentPosition.coerceAtLeast(0L)
+    val startOffset = extras.getLong(EXTRA_CHUNK_START_OFFSET_MS, -1L)
+    if (startOffset >= 0L) {
+      return startOffset + localPos
+    }
+    val currentIdx = player.currentMediaItemIndex.coerceAtLeast(0)
+    var prefixMs = 0L
+    for (i in 0 until currentIdx.coerceAtMost(player.mediaItemCount)) {
+      val itemExtras = player.getMediaItemAt(i).mediaMetadata.extras
+      val dur = itemExtras?.getLong(EXTRA_CHUNK_DURATION_MS, 0L) ?: 0L
+      prefixMs += dur.coerceAtLeast(0L)
+    }
+    return prefixMs + localPos
+  }
+
+  fun findWindowSeekTarget(player: Player, targetChapterPosMs: Long): Pair<Int, Long>? {
+    val count = player.mediaItemCount
+    if (count == 0) return null
+    val firstExtras = player.getMediaItemAt(0).mediaMetadata.extras ?: return null
+    val firstStart = firstExtras.getLong(EXTRA_CHUNK_START_OFFSET_MS, -1L)
+    if (firstStart < 0L || targetChapterPosMs < firstStart) return null
+
+    for (idx in 0 until count) {
+      val extras = player.getMediaItemAt(idx).mediaMetadata.extras ?: return null
+      val start = extras.getLong(EXTRA_CHUNK_START_OFFSET_MS, -1L)
+      val dur = extras.getLong(EXTRA_CHUNK_DURATION_MS, 0L).coerceAtLeast(0L)
+      if (start < 0L) return null
+      val end = start + dur
+      if (targetChapterPosMs < end) {
+        return idx to (targetChapterPosMs - start).coerceIn(0L, dur)
+      }
+    }
+    return null
+  }
+
+  fun computeWindowAheadDurationMs(player: Player): Long {
+    val count = player.mediaItemCount
+    if (count == 0) return 0L
+    val currentIdx = player.currentMediaItemIndex.coerceIn(0, count - 1)
+    val currentDur =
+      player.getMediaItemAt(currentIdx).mediaMetadata.extras?.getLong(EXTRA_CHUNK_DURATION_MS, 0L)
+        ?.coerceAtLeast(0L) ?: 0L
+    var aheadMs = (currentDur - player.currentPosition.coerceAtLeast(0L)).coerceAtLeast(0L)
+    for (i in (currentIdx + 1) until count) {
+      val dur =
+        player.getMediaItemAt(i).mediaMetadata.extras?.getLong(EXTRA_CHUNK_DURATION_MS, 0L)
+          ?.coerceAtLeast(0L) ?: 0L
+      aheadMs += dur
+    }
+    return aheadMs
+  }
+
+  fun maxChunkIndexInPlayer(player: Player): Int {
+    var maxIdx = -1
+    for (i in 0 until player.mediaItemCount) {
+      val extras = player.getMediaItemAt(i).mediaMetadata.extras ?: continue
+      if (extras.getBoolean(EXTRA_IS_PROGRESSIVE_CHUNK, false)) {
+        val chunkIdx = extras.getInt(EXTRA_CHUNK_INDEX, -1)
+        if (chunkIdx > maxIdx) maxIdx = chunkIdx
+      }
+    }
+    return maxIdx
   }
 
   fun cumulativeChapterPositionMs(

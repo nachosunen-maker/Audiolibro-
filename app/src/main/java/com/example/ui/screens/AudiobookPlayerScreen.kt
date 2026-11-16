@@ -81,6 +81,7 @@ import com.example.domain.model.NarrationEstimator
 import com.example.domain.model.ProgressiveChapterPhase
 import com.example.player.PlaybackUiState
 import com.example.ui.components.BookCover
+import com.example.ui.components.PlaybackAvailabilityBar
 import com.example.ui.components.ProgressiveSegmentedBar
 import com.example.ui.components.ProgressiveStateLegend
 import com.example.ui.viewmodel.PlayerViewModel
@@ -494,13 +495,9 @@ private fun ProgressiveBufferPlayerCard(
       } else {
         1f
       }
-  val playedFraction =
-    if (playbackState.bufferedDurationMs > 0L) {
-      (playbackState.positionMs.toFloat() / playbackState.bufferedDurationMs.toFloat()).coerceIn(0f, 1f) *
-        preparedFraction
-    } else {
-      0f
-    }
+  val synthPercent =
+    progressiveState?.chapterPercent
+      ?: (preparedFraction * 100f).toInt().coerceIn(0, 100)
 
   Surface(
     modifier = Modifier.fillMaxWidth().testTag("player_progressive_buffer_card"),
@@ -595,12 +592,26 @@ private fun ProgressiveBufferPlayerCard(
       }
 
       ProgressiveSegmentedBar(
-        playedFraction = playedFraction,
+        playedFraction = 0f,
         preparedFraction = preparedFraction,
         isGeneratingAhead = progressiveState?.isSynthesizing == true,
         isPaused = phase == ProgressiveChapterPhase.PAUSED,
         isError = phase == ProgressiveChapterPhase.RECOVERABLE_ERROR,
         totalChunks = progressiveState?.totalChunks ?: 1,
+      )
+
+      Text(
+        text =
+          "Síntesis de texto: $synthPercent % · Listos ${progressiveState?.chunksCompleted ?: 0}/${progressiveState?.totalChunks ?: 0} fragmentos",
+        style = MaterialTheme.typography.labelSmall,
+        color = MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+
+      PlaybackAvailabilityBar(
+        playedDurationMs = playbackState.positionMs,
+        bufferedDurationMs = playbackState.bufferedDurationMs,
+        aheadDurationMs = playbackState.aheadBufferedDurationMs,
+        isWaitingForBuffer = playbackState.isWaitingForBuffer,
       )
 
       ProgressiveStateLegend(

@@ -1,6 +1,6 @@
 {
-  "name": "Audiolibro",
-  "description": "Aplicación Android nativa para analizar archivos EPUB localmente, extraer capítulos y preparar su conversión a audiolibro con voz IA.",
+  "name": "AudioLibreaMe",
+  "description": "AudioLibreaMe: aplicación Android 100 % local y sin conexión para analizar archivos EPUB, extraer capítulos y generar audiolibros en español mediante Piper VITS (es_ES-sharvard-medium), eSpeak NG y sherpa-onnx.",
   "requestFramePermissions": [],
   "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
 }

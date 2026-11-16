@@ -29,10 +29,12 @@ import com.example.MainActivity
 import com.example.data.local.AppDatabase
 import com.example.data.local.AudiobookDao
 import com.example.data.local.BookEntity
+import com.example.data.local.ChapterChunkEntity
 import com.example.data.local.ChapterEntity
 import com.example.data.repository.AudiobookRepository
 import com.example.data.storage.AudiobookStorageManager
 import com.example.domain.model.AudioGenerationStatus
+import com.example.domain.model.ChapterChunkStatus
 import com.example.domain.model.NarratorVoice
 import com.example.player.AudiobookMediaHelper
 import com.example.player.AudiobookPlaybackController
@@ -323,6 +325,139 @@ class AudiobookPhase3PlaybackRobolectricTest {
       } finally {
         serviceController.destroy()
         Shadows.shadowOf(Looper.getMainLooper()).idle()
+      }
+    }
+
+  @Test
+  fun `service observes progressive chunks persists cumulative chapter position and resumes without UI controller`() =
+    runBlocking {
+      val dao = db.audiobookDao()
+      val bookId = "book-p3-prog"
+      storageManager.deleteBookAudioFiles(bookId)
+      try {
+        val wav0 = storageManager.chunkWavFile(bookId, 1, 0)
+        val wav1 = storageManager.chunkWavFile(bookId, 1, 1)
+        val pcm = ByteArray(22_050 * 2 * 2) { 0x12 } // ~2000ms at 22,050Hz mono PCM-16
+        val info0 = WavAudioCodec.writePcmAsWav(pcm, wav0)
+        val info1 = WavAudioCodec.writePcmAsWav(pcm, wav1)
+
+        val bookEntity =
+          BookEntity(
+            id = bookId,
+            title = "Novela Progresiva",
+            author = "Autora Demo",
+            language = "es",
+            publisher = "",
+            description = "",
+            coverImagePath = null,
+            sourceFileName = "prog.epub",
+            selectedVoice = NarratorVoice.FEMALE.name,
+            totalChapters = 1,
+            totalWords = 200,
+            totalCharacters = 1200,
+            estimatedMinutes = 2,
+            importedAt = 100L,
+          )
+        val ch1 =
+          ChapterEntity(
+            id = "${bookId}_ch_1",
+            bookId = bookId,
+            chapterIndex = 1,
+            title = "Capítulo 1 Progresivo",
+            contentText = "Texto progresivo.",
+            wordCount = 200,
+            characterCount = 1200,
+            estimatedMinutes = 2,
+            audioStatus = AudioGenerationStatus.GENERATING.name,
+            audioFilePath = null,
+            generatedChunks = 1,
+            totalChunks = 2,
+          )
+        val chunk0 =
+          ChapterChunkEntity(
+            id = "${ch1.id}_part_0",
+            bookId = bookId,
+            chapterId = ch1.id,
+            chapterIndex = 1,
+            chunkIndex = 0,
+            textContent = "A".repeat(600),
+            voiceName = NarratorVoice.FEMALE.name,
+            status = ChapterChunkStatus.COMPLETED.name,
+            wavFilePath = wav0.absolutePath,
+            byteSize = wav0.length(),
+            durationMs = info0.durationMs,
+          )
+        val chunk1Pending =
+          ChapterChunkEntity(
+            id = "${ch1.id}_part_1",
+            bookId = bookId,
+            chapterId = ch1.id,
+            chapterIndex = 1,
+            chunkIndex = 1,
+            textContent = "B".repeat(600),
+            voiceName = NarratorVoice.FEMALE.name,
+            status = ChapterChunkStatus.PENDING.name,
+            wavFilePath = null,
+            byteSize = 0L,
+            durationMs = 0L,
+          )
+        dao.insertBookWithChapters(bookEntity, listOf(ch1))
+        dao.upsertChunks(listOf(chunk0, chunk1Pending))
+
+        val serviceController = Robolectric.buildService(AudiobookPlaybackService::class.java)
+        val service = serviceController.create().get()
+        try {
+          service.repositoryOverride = repository
+          val exoPlayer = service.currentSessionForTesting()!!.player
+          val initialItems =
+            AudiobookMediaHelper.buildProgressiveMediaItems(
+              bookEntity.toDomain(),
+              ch1.toDomain(),
+              listOf(chunk0.toDomain()),
+            )
+          exoPlayer.setMediaItems(initialItems, 0, 0L)
+          exoPlayer.prepare()
+          exoPlayer.playWhenReady = true
+          Shadows.shadowOf(Looper.getMainLooper()).idle()
+          assertEquals(1, exoPlayer.mediaItemCount)
+
+          // Emit chunk 1 into Room with no UI controller attached; service must append it automatically.
+          dao.upsertChunk(
+            chunk1Pending.copy(
+              status = ChapterChunkStatus.COMPLETED.name,
+              wavFilePath = wav1.absolutePath,
+              byteSize = wav1.length(),
+              durationMs = info1.durationMs,
+            )
+          )
+          awaitCondition { exoPlayer.mediaItemCount == 2 }
+          assertEquals("$bookId:1:chunk:1", exoPlayer.getMediaItemAt(1).mediaId)
+
+          // Move playback to chunk 1 offset 250ms and pause -> service persists cumulative position (chunk0 + 250ms).
+          exoPlayer.seekTo(1, 250L)
+          exoPlayer.pause()
+          Shadows.shadowOf(Looper.getMainLooper()).idle()
+          service.awaitPersistenceForTesting()
+
+          val savedBook = dao.getBookOnce(bookId)
+          assertEquals(1, savedBook?.lastPlayedChapterIndex)
+          assertTrue(
+            "Expected cumulative position >= ${info0.durationMs + 250L}, got ${savedBook?.lastPlayedPositionMs}",
+            (savedBook?.lastPlayedPositionMs ?: 0L) >= info0.durationMs + 250L,
+          )
+
+          // Resumption reconstructs chunk playlist at chunk index 1 and offset >= 250ms.
+          val resumption =
+            awaitFuture(service.triggerPlaybackResumptionForTesting(createTestControllerInfo()))
+          assertEquals(2, resumption.mediaItems.size)
+          assertEquals(1, resumption.startIndex)
+          assertTrue(resumption.startPositionMs >= 250L)
+        } finally {
+          serviceController.destroy()
+          Shadows.shadowOf(Looper.getMainLooper()).idle()
+        }
+      } finally {
+        storageManager.deleteBookAudioFiles(bookId)
       }
     }
 

@@ -574,6 +574,7 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
 
       // Simular callback de Android 15+: Service.onTimeout(startId, FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING)
       service.onTimeout(1, ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PROCESSING)
+      repo.awaitPersistenceForTesting()
 
       // 1. WakeLock liberado inmediatamente sin fuga
       assertFalse(service.isWakeLockHeldForTesting())
@@ -795,13 +796,13 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
       }
       assertTrue("START_STICKY null intent should restore persisted Room task", reachedSynth)
 
-      // Cancelación explícita del usuario libera WakeLock inmediatamente y persiste PAUSED_BY_USER
-      val cancelIntent =
+      // Pausa explícita del usuario libera WakeLock inmediatamente y persiste PAUSED_BY_USER
+      val pauseIntent =
         Intent(context, AudiobookGenerationService::class.java).apply {
-          action = AudiobookGenerationService.ACTION_CANCEL_GENERATION
+          action = AudiobookGenerationService.ACTION_PAUSE_GENERATION
           putExtra(AudiobookGenerationService.EXTRA_BOOK_ID, "svc-book-1")
         }
-      service.onStartCommand(cancelIntent, 0, 2)
+      service.onStartCommand(pauseIntent, 0, 2)
       org.robolectric.shadows.ShadowLooper.idleMainLooper()
       assertFalse(service.isWakeLockHeldForTesting())
 
@@ -813,4 +814,111 @@ class AudiobookPersistenceAndRecoveryRobolectricTest {
       service.awaitJobsForTesting()
       repo.awaitAndCloseForTesting()
     }
+
+  @Test
+  fun `J_explicit_cancel_persists_CANCELLED_cleans_orphans_and_prevents_auto_recovery`() = runTest {
+    val dao = db.audiobookDao()
+    dao.insertBookWithChapters(
+      BookEntity(
+        id = "cancel-book-1",
+        title = "Libro Cancelable",
+        author = "Autor",
+        language = "es",
+        publisher = "",
+        description = "",
+        coverImagePath = null,
+        sourceFileName = "cancel.epub",
+        selectedVoice = NarratorVoice.FEMALE.name,
+        totalChapters = 1,
+        totalWords = 6,
+        totalCharacters = 40,
+        estimatedMinutes = 1,
+        importedAt = 10L,
+      ),
+      listOf(
+        ChapterEntity(
+          id = "cancel-book-1_ch_1",
+          bookId = "cancel-book-1",
+          chapterIndex = 1,
+          title = "Cap 1",
+          contentText = "Texto de capítulo para probar cancelación definitiva.",
+          wordCount = 7,
+          characterCount = 54,
+          estimatedMinutes = 1,
+          audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
+          audioFilePath = null,
+        )
+      ),
+    )
+
+    val orphanTmp = File(storageManager.chunkWavFile("cancel-book-1", 1, 0).parentFile, "orphan_part_0.wav.tmp")
+    orphanTmp.writeBytes(byteArrayOf(1, 2, 3, 4))
+    assertTrue(orphanTmp.exists())
+
+    val blockingLatch = CountDownLatch(1)
+    val slowProvider =
+      object : AudioSynthesisProvider {
+        override val isConfigured = true
+        override val providerName = "CancelTest"
+        override val modelId = "es_ES-sharvard-medium"
+
+        override suspend fun synthesizeFragment(
+          text: String,
+          voice: NarratorVoice,
+          bookTitle: String,
+          chapterTitle: String,
+        ): Result<SynthesizedAudioPayload> {
+          blockingLatch.countDown()
+          delay(30_000L)
+          return Result.success(
+            SynthesizedAudioPayload(
+              bytes = ByteArray(4410) { 2 },
+              mimeType = "audio/L16;rate=22050;channels=1",
+              sampleRate = 22_050,
+            )
+          )
+        }
+      }
+
+    val repo =
+      trackRepo(
+        AudiobookRepository(
+          context = context,
+          dao = dao,
+          storageManager = storageManager,
+          audioSynthesisProvider = slowProvider,
+        )
+      )
+
+    val serviceController = Robolectric.buildService(AudiobookGenerationService::class.java)
+    val service = serviceController.create().get()
+    service.repositoryOverride = repo
+
+    val startIntent =
+      Intent(context, AudiobookGenerationService::class.java).apply {
+        action = AudiobookGenerationService.ACTION_START_GENERATION
+        putExtra(AudiobookGenerationService.EXTRA_BOOK_ID, "cancel-book-1")
+      }
+    service.onStartCommand(startIntent, 0, 1)
+    assertTrue("Should reach slow synth fragment", blockingLatch.await(5, TimeUnit.SECONDS))
+
+    val cancelIntent =
+      Intent(context, AudiobookGenerationService::class.java).apply {
+        action = AudiobookGenerationService.ACTION_CANCEL_GENERATION
+        putExtra(AudiobookGenerationService.EXTRA_BOOK_ID, "cancel-book-1")
+      }
+    service.onStartCommand(cancelIntent, 0, 2)
+    org.robolectric.shadows.ShadowLooper.idleMainLooper()
+    assertFalse(service.isWakeLockHeldForTesting())
+
+    repo.awaitPersistenceForTesting()
+    val cancelledTask = dao.getGenerationTaskOnce("cancel-book-1")
+    assertEquals(GenerationTaskStatus.CANCELLED.name, cancelledTask?.status)
+    assertTrue("CANCELLED task must not be recoverable", dao.getRecoverableGenerationTasksOnce().isEmpty())
+    assertFalse("Orphan temp file must be removed", orphanTmp.exists())
+
+    serviceController.destroy()
+    service.awaitJobsForTesting()
+    repo.awaitAndCloseForTesting()
+  }
 }

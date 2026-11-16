@@ -41,6 +41,20 @@ class AudiobookStorageManager(private val context: Context) {
     }
   }
 
+  fun cleanOrphanedTempFiles(bookId: String): Int {
+    val root = bookRootDir(bookId)
+    if (!root.exists()) return 0
+    var removed = 0
+    root.walkTopDown().forEach { file ->
+      if (file.isFile && (file.name.endsWith(".tmp") || file.name.endsWith(".part"))) {
+        if (file.delete()) {
+          removed++
+        }
+      }
+    }
+    return removed
+  }
+
   fun availableStorageBytes(): Long = runCatching { context.filesDir.usableSpace }.getOrDefault(0L)
 
   fun hasSufficientStorageSpace(minBytes: Long = MIN_FREE_STORAGE_BYTES): Boolean {

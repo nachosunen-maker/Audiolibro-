@@ -106,16 +106,28 @@ class AudiobookPlaybackController(
         persistCurrentPositionNow()
       }
 
+      override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+        if (!playWhenReady) {
+          _uiState.update { it.copy(isWaitingForBuffer = false) }
+        }
+        syncFromPlayer()
+      }
+
       override fun onPlaybackStateChanged(playbackState: Int) {
         if (playbackState == Player.STATE_READY && playStartRequestedNs > 0L) {
           val latency = ((System.nanoTime() - playStartRequestedNs) / 1_000_000L).coerceAtLeast(0L)
           playStartRequestedNs = 0L
           _uiState.update { it.copy(lastPlayStartLatencyMs = latency) }
         }
+        if (playbackState == Player.STATE_READY) {
+          _uiState.update { it.copy(isWaitingForBuffer = false) }
+        }
         if (playbackState == Player.STATE_ENDED && _uiState.value.isProgressiveActive) {
           val curChap = _uiState.value.playlistChapters.firstOrNull()
           val totalChunks = curChap?.totalChunks ?: 0
-          if (totalChunks > 0 && progressiveChunks.size < totalChunks) {
+          val player = activePlayer
+          val shouldWait = player == null || player.playWhenReady
+          if (shouldWait && totalChunks > 0 && progressiveChunks.size < totalChunks) {
             _uiState.update { it.copy(isWaitingForBuffer = true) }
           }
         }
@@ -409,14 +421,35 @@ class AudiobookPlaybackController(
             return@collect
           }
 
-          val validContiguous = AudiobookMediaHelper.extractContiguousValidChunks(latestChunks)
-          val newlyReady = validContiguous.filter { it.chunkIndex > lastQueuedChunkIndex }
+          val validContiguous =
+            AudiobookMediaHelper.extractContiguousValidChunks(
+              latestChunks.filter { it.voiceName == book.selectedVoice.name }
+            )
+          if (validContiguous.isEmpty()) return@collect
+
+          val existingIds =
+            (0 until player.mediaItemCount).mapTo(HashSet()) { idx ->
+              player.getMediaItemAt(idx).mediaId
+            }
+          val newlyReady =
+            validContiguous.filter { chunk ->
+              val expectedId = "${book.id}:${chapter.chapterIndex}:chunk:${chunk.chunkIndex}"
+              !existingIds.contains(expectedId)
+            }
+
+          val previousCount = player.mediaItemCount
           if (newlyReady.isNotEmpty()) {
-            val previousCount = player.mediaItemCount
             val newMediaItems =
               AudiobookMediaHelper.buildProgressiveMediaItems(book, chapter, newlyReady)
             // Añadir al final en tiempo real sin reiniciar ni interrumpir la reproducción activa.
             player.addMediaItems(newMediaItems)
+          }
+
+          val newChunksArrived =
+            newlyReady.isNotEmpty() ||
+              validContiguous.size > progressiveChunks.size ||
+              player.mediaItemCount > previousCount
+          if (newChunksArrived) {
             progressiveChunks = validContiguous
             lastQueuedChunkIndex = validContiguous.last().chunkIndex
 
@@ -430,7 +463,7 @@ class AudiobookPlaybackController(
                 isWaitingForBuffer = false,
               )
             }
-            if (wasWaiting || player.playbackState == Player.STATE_ENDED) {
+            if (wasWaiting || (player.playbackState == Player.STATE_ENDED && player.playWhenReady)) {
               if (previousCount < player.mediaItemCount) {
                 player.seekTo(previousCount, 0L)
                 player.prepare()

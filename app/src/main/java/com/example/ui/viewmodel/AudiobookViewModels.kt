@@ -165,6 +165,11 @@ class BookDetailViewModel(
     repository.requestAudiobookGeneration(bookId)
   }
 
+  fun pauseGeneration() {
+    repository.pauseAudiobookGeneration(bookId)
+    refreshStorageBytes()
+  }
+
   fun cancelGeneration() {
     repository.cancelAudiobookGeneration(bookId)
     refreshStorageBytes()

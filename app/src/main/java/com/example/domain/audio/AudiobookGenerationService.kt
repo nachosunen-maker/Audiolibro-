@@ -68,6 +68,21 @@ class AudiobookGenerationService : Service() {
     val bookId = intent?.getStringExtra(EXTRA_BOOK_ID)
     Log.i(TAG, "onStartCommand(startId=$startId, action=$action, bookId=$bookId)")
 
+    if (action == ACTION_PAUSE_GENERATION) {
+      isRestoringStickyQueue = false
+      stickyRestoreJob?.cancel()
+      stickyRestoreJob = null
+      if (!bookId.isNullOrBlank()) {
+        repository.pauseAudiobookGeneration(bookId)
+      } else {
+        repository.pauseAllGenerations()
+      }
+      if (!repository.hasActiveOrQueuedGenerations()) {
+        stopServiceCleanly(startId)
+      }
+      return START_NOT_STICKY
+    }
+
     if (action == ACTION_CANCEL_GENERATION) {
       isRestoringStickyQueue = false
       stickyRestoreJob?.cancel()
@@ -286,6 +301,21 @@ class AudiobookGenerationService : Service() {
       )
 
     val targetBookId = progress?.bookId ?: fallbackBookId
+    val pauseIntent =
+      Intent(this, AudiobookGenerationService::class.java).apply {
+        action = ACTION_PAUSE_GENERATION
+        if (!targetBookId.isNullOrBlank()) {
+          putExtra(EXTRA_BOOK_ID, targetBookId)
+        }
+      }
+    val pausePendingIntent =
+      PendingIntent.getService(
+        this,
+        102,
+        pauseIntent,
+        PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+      )
+
     val cancelIntent =
       Intent(this, AudiobookGenerationService::class.java).apply {
         action = ACTION_CANCEL_GENERATION
@@ -296,14 +326,14 @@ class AudiobookGenerationService : Service() {
     val cancelPendingIntent =
       PendingIntent.getService(
         this,
-        102,
+        103,
         cancelIntent,
         PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
       )
 
     val title =
-      progress?.bookTitle?.takeIf { it.isNotBlank() }?.let { "Generando: $it" }
-        ?: "Generando audiolibro local"
+      progress?.bookTitle?.takeIf { it.isNotBlank() }?.let { "AudioLibreaMe · Generando: $it" }
+        ?: "AudioLibreaMe · Generando audiolibro local"
 
     val text =
       progress?.statusMessage?.takeIf { it.isNotBlank() }
@@ -318,7 +348,8 @@ class AudiobookGenerationService : Service() {
         .setOnlyAlertOnce(true)
         .setCategory(NotificationCompat.CATEGORY_PROGRESS)
         .setContentIntent(openPendingIntent)
-        .addAction(android.R.drawable.ic_media_pause, "Pausar", cancelPendingIntent)
+        .addAction(android.R.drawable.ic_media_pause, "Pausar", pausePendingIntent)
+        .addAction(android.R.drawable.ic_menu_close_clear_cancel, "Cancelar", cancelPendingIntent)
 
     if (progress != null && progress.totalBookChunks > 0) {
       val percent = (progress.globalProgressFraction * 100f).roundToInt().coerceIn(0, 100)
@@ -335,9 +366,10 @@ class AudiobookGenerationService : Service() {
     const val CHANNEL_ID_GENERATION = "audiolibro_generation_channel"
     const val NOTIFICATION_ID = 4102
     const val ACTION_START_GENERATION = "com.example.action.START_GENERATION"
+    const val ACTION_PAUSE_GENERATION = "com.example.action.PAUSE_GENERATION"
     const val ACTION_CANCEL_GENERATION = "com.example.action.CANCEL_GENERATION"
     const val EXTRA_BOOK_ID = "extra_book_id"
-    private const val WAKELOCK_TAG = "Audiolibro:GenerationWakeLock"
+    private const val WAKELOCK_TAG = "AudioLibreaMe:GenerationWakeLock"
 
     // Ventana de concesión segura renovada automáticamente cada 5 min mientras dura la generación,
     // sin límite fijo de 2 horas que interrumpa audiolibros extensos.
@@ -360,6 +392,17 @@ class AudiobookGenerationService : Service() {
           putExtra(EXTRA_BOOK_ID, bookId)
         }
       ContextCompat.startForegroundService(context, intent)
+    }
+
+    fun pauseBookGeneration(context: Context, bookId: String? = null) {
+      val intent =
+        Intent(context, AudiobookGenerationService::class.java).apply {
+          action = ACTION_PAUSE_GENERATION
+          if (!bookId.isNullOrBlank()) {
+            putExtra(EXTRA_BOOK_ID, bookId)
+          }
+        }
+      context.startService(intent)
     }
 
     fun stopBookGeneration(context: Context, bookId: String? = null) {

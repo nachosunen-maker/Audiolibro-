@@ -54,6 +54,7 @@ import com.example.domain.audio.VisualEffectTier
 import com.example.domain.model.NarrationEstimator
 import com.example.domain.model.ProgressiveChapterPhase
 import com.example.ui.components.BookToSoundCanvas
+import com.example.ui.components.PlaybackAvailabilityBar
 import com.example.ui.components.ProgressiveSegmentedBar
 import com.example.ui.components.ProgressiveStateLegend
 import com.example.ui.viewmodel.ProgressiveChapterViewModel
@@ -291,16 +292,8 @@ internal fun ProgressiveChapterContent(
           )
         }
 
-        val playedFraction =
-          if (state.bufferedDurationMs > 0L && state.overallChapterProgressFraction > 0f) {
-            (state.playedDurationMs.toFloat() / state.bufferedDurationMs.toFloat())
-              .coerceIn(0f, 1f) * state.overallChapterProgressFraction
-          } else {
-            0f
-          }
-
         ProgressiveSegmentedBar(
-          playedFraction = playedFraction,
+          playedFraction = 0f,
           preparedFraction = state.overallChapterProgressFraction,
           isGeneratingAhead = state.isSynthesizing,
           isPaused = state.phase == ProgressiveChapterPhase.PAUSED,
@@ -334,6 +327,13 @@ internal fun ProgressiveChapterContent(
             color = MaterialTheme.colorScheme.onSurface,
           )
         }
+
+        PlaybackAvailabilityBar(
+          playedDurationMs = state.playedDurationMs,
+          bufferedDurationMs = state.bufferedDurationMs,
+          aheadDurationMs = state.aheadDurationMs,
+          isWaitingForBuffer = false,
+        )
 
         if (state.initialReadyTargetMs > 0L && !state.isCompleteChapterReady) {
           Row(

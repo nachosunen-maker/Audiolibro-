@@ -100,6 +100,30 @@ object PiperAudioPcmEncoder {
   }
 }
 
+object PiperAudioSignalValidator {
+  fun maxAbsAmplitude(samples: FloatArray): Float {
+    var peak = 0f
+    for (sample in samples) {
+      if (sample.isFinite()) {
+        val magnitude = if (sample < 0f) -sample else sample
+        if (magnitude > peak) peak = magnitude
+      }
+    }
+    return peak
+  }
+
+  fun hasAudibleSignal(samples: FloatArray, minPeakAmplitude: Float = 1e-4f): Boolean {
+    if (samples.isEmpty()) return false
+    var peak = 0f
+    for (sample in samples) {
+      if (!sample.isFinite()) return false
+      val magnitude = if (sample < 0f) -sample else sample
+      if (magnitude > peak) peak = magnitude
+    }
+    return peak >= minPeakAmplitude
+  }
+}
+
 /**
  * Motor local de síntesis neuronal Piper VITS (`es_ES-sharvard-medium`) sobre `sherpa-onnx` 2.0.1.
  *
@@ -282,9 +306,9 @@ class SherpaOnnxLocalTtsEngine(
       }
     val inferenceElapsedMs = ((System.nanoTime() - tInferStartNs) / 1_000_000L).coerceAtLeast(0L)
 
-    if (generated.samples.isEmpty()) {
+    if (!PiperAudioSignalValidator.hasAudibleSignal(generated.samples)) {
       val errMsg =
-        "sherpa-onnx devolvió un bloque de audio vacío (speakerId=$speakerId, sentences=${phonemeSentences.size}, codepoints=$totalCodepoints)."
+        "sherpa-onnx devolvió un bloque de audio vacío o silencioso (speakerId=$speakerId, muestras=${generated.samples.size}, sentences=${phonemeSentences.size}, codepoints=$totalCodepoints)."
       Log.e(TAG, errMsg)
       throw IllegalStateException(errMsg)
     }
@@ -414,6 +438,7 @@ class SherpaOnnxLocalTtsEngine(
           requiredModel.length() > 50_000_000L &&
           requiredTokens.exists() &&
           requiredTokens.length() > 200L &&
+          parseTokensFile(requiredTokens).size >= 100 &&
           requiredEsDict.exists() &&
           requiredEsDict.length() > 1000L &&
           requiredPhontab.exists() &&
@@ -533,9 +558,9 @@ class PiperAudioSynthesisProvider(
               ((System.nanoTime() - tSynthWallStartNs) / 1_000_000L).coerceAtLeast(0L)
             currentCoroutineContext().ensureActive()
 
-            if (generated.samples.isEmpty()) {
+            if (!PiperAudioSignalValidator.hasAudibleSignal(generated.samples)) {
               Result.failure(
-                IllegalStateException("El motor local devolvió un bloque de audio vacío.")
+                IllegalStateException("El motor local devolvió audio vacío o completamente silencioso.")
               )
             } else {
               val sampleRate =

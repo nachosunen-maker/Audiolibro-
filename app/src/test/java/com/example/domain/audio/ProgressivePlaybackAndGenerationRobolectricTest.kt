@@ -25,6 +25,7 @@ import androidx.sqlite.db.framework.FrameworkSQLiteOpenHelperFactory
 import androidx.test.core.app.ApplicationProvider
 import com.example.data.local.AppDatabase
 import com.example.data.local.BookEntity
+import com.example.data.local.ChapterChunkEntity
 import com.example.data.local.ChapterEntity
 import com.example.data.repository.AudiobookRepository
 import com.example.data.storage.AudiobookStorageManager
@@ -629,9 +630,247 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
     composeRule.waitForIdle()
 
     composeRule.onNodeWithTag("progressive_play_button").performScrollTo().assertIsEnabled()
+    composeRule.onNodeWithTag("progressive_segmented_bar").performScrollTo().assertIsDisplayed()
+    composeRule.onNodeWithTag("playback_availability_bar").performScrollTo().assertIsDisplayed()
     composeRule.onNodeWithText("30 %").performScrollTo().assertIsDisplayed()
     composeRule.onNodeWithText("Efectos reducidos por ahorro o RAM").performScrollTo().assertIsDisplayed()
   }
+
+  @Test
+  fun `hydrateProgressiveChapterPreview rejects corrupt or missing READY WAV and restores true chunk progress`() =
+    runBlocking {
+      val dao = db.audiobookDao()
+      val bookId = "corrupt-ready-book"
+      val chapterId = "${bookId}_ch_1"
+      val chunk0Wav = storageManager.chunkWavFile(bookId, 1, 0)
+      WavAudioCodec.writePcmAsWav(ByteArray(22_050 * 2) { 5 }, chunk0Wav)
+      val fakeCorruptChapterWav = storageManager.chapterWavFile(bookId, 1)
+      fakeCorruptChapterWav.writeBytes(byteArrayOf(0x00, 0x01, 0x02)) // corrupt WAV header
+
+      dao.insertBookWithChapters(
+        BookEntity(
+          id = bookId,
+          title = "Libro WAV Corrupto",
+          author = "Autor",
+          language = "es",
+          publisher = "",
+          description = "",
+          coverImagePath = null,
+          sourceFileName = "corrupt.epub",
+          selectedVoice = NarratorVoice.FEMALE.name,
+          totalChapters = 1,
+          totalWords = 200,
+          totalCharacters = 1000,
+          estimatedMinutes = 2,
+          importedAt = 100L,
+        ),
+        listOf(
+          ChapterEntity(
+            id = chapterId,
+            bookId = bookId,
+            chapterIndex = 1,
+            title = "Cap 1",
+            contentText = "Texto de prueba largo.",
+            wordCount = 200,
+            characterCount = 1000,
+            estimatedMinutes = 2,
+            audioStatus = AudioGenerationStatus.READY.name,
+            audioFilePath = fakeCorruptChapterWav.absolutePath,
+            audioDurationMs = 5_000L,
+            audioSizeBytes = 3L,
+            generatedChunks = 2,
+            totalChunks = 2,
+          )
+        ),
+      )
+      dao.upsertChunks(
+        listOf(
+          ChapterChunkEntity(
+            id = "${chapterId}_part_0",
+            bookId = bookId,
+            chapterId = chapterId,
+            chapterIndex = 1,
+            chunkIndex = 0,
+            textContent = "A".repeat(400),
+            voiceName = NarratorVoice.FEMALE.name,
+            status = ChapterChunkStatus.COMPLETED.name,
+            wavFilePath = chunk0Wav.absolutePath,
+            byteSize = chunk0Wav.length(),
+            durationMs = 1_000L,
+          ),
+          ChapterChunkEntity(
+            id = "${chapterId}_part_1",
+            bookId = bookId,
+            chapterId = chapterId,
+            chapterIndex = 1,
+            chunkIndex = 1,
+            textContent = "B".repeat(600),
+            voiceName = NarratorVoice.FEMALE.name,
+            status = ChapterChunkStatus.PENDING.name,
+            wavFilePath = null,
+            byteSize = 0L,
+            durationMs = 0L,
+          ),
+        )
+      )
+
+      val provider =
+        object : AudioSynthesisProvider {
+          override val isConfigured = true
+          override val providerName = "Test"
+          override val modelId = "es_ES-sharvard-medium"
+          override suspend fun synthesizeFragment(
+            text: String,
+            voice: NarratorVoice,
+            bookTitle: String,
+            chapterTitle: String,
+          ) = Result.failure<SynthesizedAudioPayload>(IllegalStateException("unused"))
+        }
+
+      val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager, audioSynthesisProvider = provider))
+      repo.hydrateProgressiveChapterPreview(bookId, chapterIndex = 1)
+
+      val state = repo.progressiveChapterState.value!!
+      assertFalse("Corrupt final WAV must not report complete chapter ready", state.isCompleteChapterReady)
+      assertEquals(40, state.chapterPercent)
+      assertEquals(400, state.synthesizedChapterChars)
+      assertEquals(1000, state.totalChapterChars)
+
+      val repairedChapter = dao.getChapterOnce(bookId, 1)!!
+      assertEquals(AudioGenerationStatus.NOT_GENERATED.name, repairedChapter.audioStatus)
+    }
+
+  @Test
+  fun `buffer depletion on STATE_ENDED waits and auto-resumes at newly appended chunk without restarting chapter`() =
+    runBlocking {
+      val dao = db.audiobookDao()
+      val bookId = "depletion-book"
+      val chapterId = "${bookId}_ch_1"
+      val wav0 = storageManager.chunkWavFile(bookId, 1, 0)
+      val wav1 = storageManager.chunkWavFile(bookId, 1, 1)
+      val info0 = WavAudioCodec.writePcmAsWav(ByteArray(22_050 * 2 * 3) { 2 }, wav0)
+      val info1 = WavAudioCodec.writePcmAsWav(ByteArray(22_050 * 2 * 3) { 3 }, wav1)
+
+      dao.insertBookWithChapters(
+        BookEntity(
+          id = bookId,
+          title = "Libro Depletion",
+          author = "Autor",
+          language = "es",
+          publisher = "",
+          description = "",
+          coverImagePath = null,
+          sourceFileName = "dep.epub",
+          selectedVoice = NarratorVoice.FEMALE.name,
+          totalChapters = 1,
+          totalWords = 100,
+          totalCharacters = 600,
+          estimatedMinutes = 2,
+          importedAt = 100L,
+        ),
+        listOf(
+          ChapterEntity(
+            id = chapterId,
+            bookId = bookId,
+            chapterIndex = 1,
+            title = "Cap 1",
+            contentText = "Texto para probar agotamiento de búfer.",
+            wordCount = 100,
+            characterCount = 600,
+            estimatedMinutes = 2,
+            audioStatus = AudioGenerationStatus.GENERATING.name,
+            audioFilePath = null,
+            generatedChunks = 1,
+            totalChunks = 2,
+          )
+        ),
+      )
+      dao.upsertChunks(
+        listOf(
+          ChapterChunkEntity(
+            id = "${chapterId}_part_0",
+            bookId = bookId,
+            chapterId = chapterId,
+            chapterIndex = 1,
+            chunkIndex = 0,
+            textContent = "A".repeat(300),
+            voiceName = NarratorVoice.FEMALE.name,
+            status = ChapterChunkStatus.COMPLETED.name,
+            wavFilePath = wav0.absolutePath,
+            byteSize = wav0.length(),
+            durationMs = info0.durationMs,
+          ),
+          ChapterChunkEntity(
+            id = "${chapterId}_part_1",
+            bookId = bookId,
+            chapterId = chapterId,
+            chapterIndex = 1,
+            chunkIndex = 1,
+            textContent = "B".repeat(300),
+            voiceName = NarratorVoice.FEMALE.name,
+            status = ChapterChunkStatus.PENDING.name,
+            wavFilePath = null,
+            byteSize = 0L,
+            durationMs = 0L,
+          ),
+        )
+      )
+
+      val unusedProvider =
+        object : AudioSynthesisProvider {
+          override val isConfigured = true
+          override val providerName = "Test"
+          override val modelId = "es_ES-sharvard-medium"
+          override suspend fun synthesizeFragment(
+            text: String,
+            voice: NarratorVoice,
+            bookTitle: String,
+            chapterTitle: String,
+          ) = Result.failure<SynthesizedAudioPayload>(IllegalStateException("unused"))
+        }
+
+      val repo = trackRepo(AudiobookRepository(context, dao, storageManager = storageManager, audioSynthesisProvider = unusedProvider))
+      val testPlayer = InMemoryPlaylistPlayer()
+      val controller = AudiobookPlaybackController(context, repo, injectedPlayer = testPlayer)
+
+      try {
+        controller.playProgressiveChapter(bookId, chapterIndex = 1, startPositionMs = 0L)
+        awaitCondition { testPlayer.currentMediaIds().size == 1 && testPlayer.playWhenReady }
+
+        // Simular que el fragmento 0 terminó antes de llegar el fragmento 1 (buffer depletion)
+        testPlayer.simulatePlaybackEnded()
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
+        awaitCondition { controller.uiState.value.isWaitingForBuffer }
+
+        // Llega el fragmento 1 sintetizado en Room
+        dao.upsertChunk(
+          ChapterChunkEntity(
+            id = "${chapterId}_part_1",
+            bookId = bookId,
+            chapterId = chapterId,
+            chapterIndex = 1,
+            chunkIndex = 1,
+            textContent = "B".repeat(300),
+            voiceName = NarratorVoice.FEMALE.name,
+            status = ChapterChunkStatus.COMPLETED.name,
+            wavFilePath = wav1.absolutePath,
+            byteSize = wav1.length(),
+            durationMs = info1.durationMs,
+          )
+        )
+
+        awaitCondition { testPlayer.currentMediaIds().size == 2 }
+        Shadows.shadowOf(Looper.getMainLooper()).idle()
+
+        assertEquals(1, testPlayer.setMediaItemsCallCount)
+        assertEquals(1, testPlayer.currentMediaItemIndex)
+        assertEquals(Player.STATE_READY, testPlayer.playbackState)
+        assertFalse(controller.uiState.value.isWaitingForBuffer)
+      } finally {
+        controller.releaseForTesting()
+        testPlayer.release()
+      }
+    }
 
   private suspend fun awaitCondition(timeoutMs: Long = 5_000L, predicate: suspend () -> Boolean) {
     withTimeout(timeoutMs) {
@@ -655,6 +894,11 @@ class ProgressivePlaybackAndGenerationRobolectricTest {
       private set
 
     fun currentMediaIds(): List<String> = items.map { it.mediaItem.mediaId }
+
+    fun simulatePlaybackEnded() {
+      playbackStateInt = Player.STATE_ENDED
+      invalidateState()
+    }
 
     override fun getState(): State {
       return State.Builder()

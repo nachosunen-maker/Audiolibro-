@@ -44,6 +44,7 @@ import androidx.compose.material.icons.outlined.WarningAmber
 import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.Headphones
+import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.Stop
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
@@ -271,6 +272,7 @@ fun BookDetailScreen(
                   progress = state.generationProgress,
                   generationTask = state.generationTask,
                   onGenerate = startGenerationWithNotificationCheck,
+                  onPause = viewModel::pauseGeneration,
                   onCancel = viewModel::cancelGeneration,
                   onDismissError = viewModel::clearGenerationError,
                   onOpenPlayer = { onOpenPlayer(book.id, null) },
@@ -692,6 +694,7 @@ private fun AudiobookGenerationSection(
   progress: BookGenerationProgress?,
   generationTask: com.example.data.local.GenerationTaskEntity?,
   onGenerate: () -> Unit,
+  onPause: () -> Unit,
   onCancel: () -> Unit,
   onDismissError: () -> Unit,
   onOpenPlayer: () -> Unit,
@@ -715,6 +718,7 @@ private fun AudiobookGenerationSection(
       (readyCount > 0 || hasPartialChunks || hasStaleGenerating ||
         progress?.phase == GenerationPhase.INTERRUPTED ||
         taskStatus == com.example.domain.model.GenerationTaskStatus.PAUSED_BY_USER ||
+        taskStatus == com.example.domain.model.GenerationTaskStatus.CANCELLED ||
         isAutoRecoverPending)
   val persistedChapterError =
     chapters.firstOrNull { it.audioStatus == AudioGenerationStatus.ERROR }?.generationError
@@ -865,6 +869,8 @@ private fun AudiobookGenerationSection(
             isAutoRecoverPending -> "Generación en cola · reanudación automática activa"
             taskStatus == com.example.domain.model.GenerationTaskStatus.PAUSED_BY_USER ->
               "Generación pausada por el usuario"
+            taskStatus == com.example.domain.model.GenerationTaskStatus.CANCELLED ->
+              "Generación cancelada por el usuario"
             else -> "Generación interrumpida · pendiente de reanudación"
           }
         val bannerBody =
@@ -960,13 +966,22 @@ private fun AudiobookGenerationSection(
       ) {
         if (isRunning) {
           OutlinedButton(
+            onClick = onPause,
+            modifier = Modifier.weight(1f).height(48.dp).testTag("pause_generation_button"),
+            shape = MaterialTheme.shapes.medium,
+          ) {
+            Icon(imageVector = Icons.Rounded.Pause, contentDescription = null)
+            Spacer(modifier = Modifier.width(6.dp))
+            Text("Pausar", maxLines = 1, overflow = TextOverflow.Ellipsis)
+          }
+          OutlinedButton(
             onClick = onCancel,
             modifier = Modifier.weight(1f).height(48.dp).testTag("cancel_generation_button"),
             shape = MaterialTheme.shapes.medium,
           ) {
             Icon(imageVector = Icons.Rounded.Stop, contentDescription = null)
             Spacer(modifier = Modifier.width(6.dp))
-            Text("Pausar generación")
+            Text("Cancelar", maxLines = 1, overflow = TextOverflow.Ellipsis)
           }
         } else if (!bookWithChapters.isCompleteAudiobookReady) {
           Button(

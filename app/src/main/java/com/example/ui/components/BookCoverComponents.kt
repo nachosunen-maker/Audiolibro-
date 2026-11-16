@@ -257,7 +257,7 @@ fun ArchitectureInfoSheet(
       verticalArrangement = Arrangement.spacedBy(16.dp),
     ) {
       Text(
-        text = "Arquitectura de Audiolibro",
+        text = "Arquitectura de AudioLibreaMe",
         style = MaterialTheme.typography.headlineSmall,
         color = MaterialTheme.colorScheme.onSurface,
       )
@@ -326,7 +326,7 @@ fun LegalNoticesDialog(onDismiss: () -> Unit) {
           title = "Aviso sobre voces sintéticas",
           license = "Generación neuronal local",
           body =
-            "Las narraciones generadas por Audiolibro se producen de forma sintética mediante modelos neuronales entrenados con grabaciones humanas. No constituyen grabaciones literales ni actuaciones directas de los hablantes originales.",
+            "Las narraciones generadas por AudioLibreaMe se producen de forma sintética mediante modelos neuronales entrenados con grabaciones humanas. No constituyen grabaciones literales ni actuaciones directas de los hablantes originales.",
         )
         HorizontalDivider(color = MaterialTheme.colorScheme.outlineVariant)
         LegalLicenseBlock(

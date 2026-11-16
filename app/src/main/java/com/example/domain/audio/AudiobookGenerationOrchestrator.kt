@@ -14,8 +14,10 @@ import com.example.domain.model.NarratorVoice
 import com.example.domain.model.ProgressiveChapterPhase
 import java.io.File
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.NonCancellable
 import kotlinx.coroutines.currentCoroutineContext
 import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.withContext
 
 enum class GenerationPhase {
   IDLE,
@@ -63,6 +65,7 @@ class AudiobookGenerationOrchestrator(
 
   suspend fun generateBookAudiobook(
     bookId: String,
+    cancellationStatusProvider: (String) -> GenerationTaskStatus? = { null },
     onProgress: (BookGenerationProgress) -> Unit = {},
   ): Result<Unit> {
     var activeVoiceName = NarratorVoice.FEMALE.name
@@ -79,6 +82,7 @@ class AudiobookGenerationOrchestrator(
           ?: return Result.failure(IllegalStateException("No se encontró el libro en la biblioteca."))
       val voice = NarratorVoice.fromNameOrDefault(book.selectedVoice)
       activeVoiceName = voice.name
+      storage.cleanOrphanedTempFiles(bookId)
       val chapters = dao.getChaptersOnce(bookId).sortedBy { it.chapterIndex }
 
       if (chapters.isEmpty()) {
@@ -134,8 +138,7 @@ class AudiobookGenerationOrchestrator(
         val chapterFile = chapter.audioFilePath?.let { File(it) }
         val chapterAlreadyValid =
           chapter.audioStatus == AudioGenerationStatus.READY.name &&
-            chapterFile != null &&
-            WavAudioCodec.isValidWavFile(chapterFile) &&
+            isHealthyWavFile(chapterFile) &&
             (existingChunks.isEmpty() || existingChunks.all { it.voiceName == voice.name })
 
         chapterValidStatus[chapter.id] = chapterAlreadyValid
@@ -479,6 +482,11 @@ class AudiobookGenerationOrchestrator(
             "Capítulo $chapterNumber/${chapters.size}: concatenando por streaming ${chunkFiles.size} fragmentos en ${finalChapterFile.name}...",
           )
           val mergedInfo = WavAudioCodec.mergeWavFiles(chunkFiles, finalChapterFile)
+          if (mergedInfo.durationMs <= 0L || !isHealthyWavFile(finalChapterFile)) {
+            throw java.io.IOException(
+              "El archivo WAV final del capítulo $chapterNumber resultó vacío o corrupto."
+            )
+          }
           Log.i(
             TAG,
             "Capítulo $chapterNumber completado: ${finalChapterFile.name} (${mergedInfo.durationMs} ms, ${finalChapterFile.length()} bytes)",
@@ -495,28 +503,45 @@ class AudiobookGenerationOrchestrator(
           )
           completedChapters += 1
         } catch (e: CancellationException) {
-          dao.updateChapterAudioState(
-            chapterId = chapter.id,
-            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
-            audioFilePath = null,
-            audioDurationMs = 0L,
-            audioSizeBytes = 0L,
-            generatedChunks = doneCount,
-            totalChunks = totalChunks,
-            generationError = null,
-          )
-          val latestTask = dao.getGenerationTaskOnce(bookId)
-          if (latestTask != null && latestTask.parsedStatus() != GenerationTaskStatus.PAUSED_BY_USER) {
-            dao.updateGenerationTaskProgress(
-              bookId = bookId,
-              status = GenerationTaskStatus.INTERRUPTED_BY_OS.name,
-              currentChapterIndex = currentChapterIdx,
-              currentChunkIndex = currentChunkIdx,
-              completedChunks = completedBookChunks,
-              totalChunks = totalBookChunks,
-              updatedAtMs = System.currentTimeMillis(),
-              lastValidProgressAtMs = latestTask.lastValidProgressAtMs,
+          withContext(NonCancellable) {
+            storage.cleanOrphanedTempFiles(bookId)
+            val requestedStatus = cancellationStatusProvider(bookId)
+            val latestTask = dao.getGenerationTaskOnce(bookId)
+            val resolvedStatus =
+              when {
+                requestedStatus == GenerationTaskStatus.CANCELLED ||
+                  latestTask?.parsedStatus() == GenerationTaskStatus.CANCELLED ->
+                  GenerationTaskStatus.CANCELLED
+                requestedStatus == GenerationTaskStatus.PAUSED_BY_USER ||
+                  latestTask?.parsedStatus() == GenerationTaskStatus.PAUSED_BY_USER ->
+                  GenerationTaskStatus.PAUSED_BY_USER
+                else -> GenerationTaskStatus.INTERRUPTED_BY_OS
+              }
+            dao.updateChapterAudioState(
+              chapterId = chapter.id,
+              audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
+              audioFilePath = null,
+              audioDurationMs = 0L,
+              audioSizeBytes = 0L,
+              generatedChunks = doneCount,
+              totalChunks = totalChunks,
+              generationError = null,
             )
+            if (latestTask != null &&
+              latestTask.parsedStatus() != GenerationTaskStatus.COMPLETED &&
+              latestTask.parsedStatus() != GenerationTaskStatus.ERROR
+            ) {
+              dao.updateGenerationTaskProgress(
+                bookId = bookId,
+                status = resolvedStatus.name,
+                currentChapterIndex = currentChapterIdx,
+                currentChunkIndex = currentChunkIdx,
+                completedChunks = completedBookChunks,
+                totalChunks = totalBookChunks,
+                updatedAtMs = System.currentTimeMillis(),
+                lastValidProgressAtMs = latestTask.lastValidProgressAtMs,
+              )
+            }
           }
           throw e
         } catch (e: Exception) {
@@ -614,6 +639,7 @@ class AudiobookGenerationOrchestrator(
     playbackStateProvider: () -> ProgressivePlaybackSnapshot,
     isPausedProvider: () -> Boolean,
     sessionActiveProvider: () -> Boolean,
+    cancellationStatusProvider: (String) -> GenerationTaskStatus? = { null },
     awaitSignal: suspend () -> Unit,
     onProgressiveState: (ProgressiveChapterState) -> Unit,
   ): Result<Unit> {
@@ -634,14 +660,15 @@ class AudiobookGenerationOrchestrator(
       activeChapterEntity = chapter
       val chapterNumber = (chapterPos + 1).coerceAtLeast(1)
       val voice = NarratorVoice.fromNameOrDefault(book.selectedVoice)
+      storage.cleanOrphanedTempFiles(bookId)
 
       val existingFile = chapter.audioFilePath?.let { File(it) }
       val existingChunks = dao.getChunksForChapterOnce(chapter.id).sortedBy { it.chunkIndex }
+      val matchingVoiceChunks = existingChunks.filter { it.voiceName == voice.name }
+      val voiceMatches = existingChunks.isEmpty() || matchingVoiceChunks.size == existingChunks.size
+      val validExistingWav = isHealthyWavFile(existingFile)
       val alreadyComplete =
-        chapter.audioStatus == AudioGenerationStatus.READY.name &&
-          existingFile != null &&
-          WavAudioCodec.isValidWavFile(existingFile) &&
-          (existingChunks.isEmpty() || existingChunks.all { it.voiceName == voice.name })
+        chapter.audioStatus == AudioGenerationStatus.READY.name && validExistingWav && voiceMatches
 
       if (alreadyComplete) {
         val dur = chapter.audioDurationMs.coerceAtLeast(WavAudioCodec.readWavInfo(existingFile!!)?.durationMs ?: 0L)
@@ -684,13 +711,36 @@ class AudiobookGenerationOrchestrator(
         return Result.success(Unit)
       }
 
+      if (chapter.audioStatus == AudioGenerationStatus.READY.name) {
+        val repairedCount =
+          if (voiceMatches) {
+            matchingVoiceChunks.count { ch ->
+              ch.status == ChapterChunkStatus.COMPLETED.name &&
+                isHealthyWavFile(ch.wavFilePath?.let(::File))
+            }
+          } else {
+            0
+          }
+        dao.updateChapterAudioState(
+          chapterId = chapter.id,
+          audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
+          audioFilePath = null,
+          audioDurationMs = 0L,
+          audioSizeBytes = 0L,
+          generatedChunks = repairedCount,
+          totalChunks = if (voiceMatches) existingChunks.size else 0,
+          generationError = null,
+        )
+      }
+
       val initialTotalChars =
-        if (existingChunks.isNotEmpty()) {
-          ProgressiveChapterProgressCalculator.calculateTotalChars(existingChunks)
+        if (matchingVoiceChunks.isNotEmpty()) {
+          ProgressiveChapterProgressCalculator.calculateTotalChars(matchingVoiceChunks)
         } else {
           chapter.characterCount.coerceAtLeast(chapter.contentText.length)
         }
-      val initialSynthesizedChars = ProgressiveChapterProgressCalculator.calculateSynthesizedChars(existingChunks)
+      val initialSynthesizedChars =
+        ProgressiveChapterProgressCalculator.calculateSynthesizedChars(matchingVoiceChunks)
 
       onProgressiveState(
         ProgressiveChapterState(
@@ -805,7 +855,10 @@ class AudiobookGenerationOrchestrator(
           val chunkFiles = chunks.mapNotNull { it.wavFilePath?.let(::File) }
           val finalChapterFile = storage.chapterWavFile(bookId, chapter.chapterIndex)
           val mergedInfo = WavAudioCodec.mergeWavFiles(chunkFiles, finalChapterFile)
-          val isFinalWavValid = finalChapterFile.exists() && finalChapterFile.length() >= 44L && WavAudioCodec.isValidWavFile(finalChapterFile)
+          val isFinalWavValid = mergedInfo.durationMs > 0L && isHealthyWavFile(finalChapterFile)
+          if (!isFinalWavValid) {
+            throw java.io.IOException("El archivo WAV final del capítulo resultó vacío o dañado.")
+          }
           val finalNow = System.currentTimeMillis()
           dao.updateChapterAudioState(
             chapterId = chapter.id,
@@ -1207,40 +1260,58 @@ class AudiobookGenerationOrchestrator(
       @Suppress("UNREACHABLE_CODE")
       Result.success(Unit)
     } catch (e: CancellationException) {
-      val ch = activeChapterEntity
-      if (ch != null) {
-        val currentChunks = runCatching { dao.getChunksForChapterOnce(ch.id) }.getOrDefault(emptyList())
-        val validCount =
-          currentChunks.count {
-            it.status == ChapterChunkStatus.COMPLETED.name &&
-              !it.wavFilePath.isNullOrBlank() &&
-              WavAudioCodec.isValidWavFile(File(it.wavFilePath))
+      withContext(NonCancellable) {
+        storage.cleanOrphanedTempFiles(bookId)
+        val ch = activeChapterEntity
+        if (ch != null) {
+          val currentChunks = runCatching { dao.getChunksForChapterOnce(ch.id) }.getOrDefault(emptyList())
+          val validCount =
+            currentChunks.count {
+              it.status == ChapterChunkStatus.COMPLETED.name &&
+                !it.wavFilePath.isNullOrBlank() &&
+                WavAudioCodec.isValidWavFile(File(it.wavFilePath))
+            }
+          val latestChapter = runCatching { dao.getChapterOnce(bookId, ch.chapterIndex) }.getOrNull()
+          if (latestChapter?.audioStatus != AudioGenerationStatus.READY.name) {
+            dao.updateChapterAudioState(
+              chapterId = ch.id,
+              audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
+              audioFilePath = null,
+              audioDurationMs = currentChunks.filter { it.status == ChapterChunkStatus.COMPLETED.name }.sumOf { it.durationMs },
+              audioSizeBytes = currentChunks.sumOf { it.byteSize },
+              generatedChunks = validCount,
+              totalChunks = activeChunksCount.coerceAtLeast(currentChunks.size),
+              generationError = null,
+            )
           }
-        if (ch.audioStatus != AudioGenerationStatus.READY.name) {
-          dao.updateChapterAudioState(
-            chapterId = ch.id,
-            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
-            audioFilePath = null,
-            audioDurationMs = currentChunks.filter { it.status == ChapterChunkStatus.COMPLETED.name }.sumOf { it.durationMs },
-            audioSizeBytes = currentChunks.sumOf { it.byteSize },
-            generatedChunks = validCount,
-            totalChunks = activeChunksCount.coerceAtLeast(currentChunks.size),
-            generationError = null,
-          )
-        }
-        val task = dao.getGenerationTaskOnce(bookId)
-        if (task != null && task.parsedStatus() != GenerationTaskStatus.COMPLETED && task.parsedStatus() != GenerationTaskStatus.ERROR) {
-          dao.updateGenerationTaskProgress(
-            bookId = bookId,
-            status = GenerationTaskStatus.PAUSED_BY_USER.name,
-            currentChapterIndex = ch.chapterIndex,
-            currentChunkIndex = validCount,
-            completedChunks = validCount,
-            totalChunks = activeChunksCount.coerceAtLeast(currentChunks.size),
-            updatedAtMs = System.currentTimeMillis(),
-            lastValidProgressAtMs = task.lastValidProgressAtMs,
-            measuredRtf = rtfEstimator.currentRtf(),
-          )
+          val task = dao.getGenerationTaskOnce(bookId)
+          if (task != null &&
+            task.parsedStatus() != GenerationTaskStatus.COMPLETED &&
+            task.parsedStatus() != GenerationTaskStatus.ERROR
+          ) {
+            val requestedStatus = cancellationStatusProvider(bookId)
+            val resolvedStatus =
+              when {
+                requestedStatus == GenerationTaskStatus.CANCELLED ||
+                  task.parsedStatus() == GenerationTaskStatus.CANCELLED ->
+                  GenerationTaskStatus.CANCELLED
+                requestedStatus == GenerationTaskStatus.PAUSED_BY_USER ||
+                  task.parsedStatus() == GenerationTaskStatus.PAUSED_BY_USER ->
+                  GenerationTaskStatus.PAUSED_BY_USER
+                else -> GenerationTaskStatus.PAUSED_BY_USER
+              }
+            dao.updateGenerationTaskProgress(
+              bookId = bookId,
+              status = resolvedStatus.name,
+              currentChapterIndex = ch.chapterIndex,
+              currentChunkIndex = validCount,
+              completedChunks = validCount,
+              totalChunks = activeChunksCount.coerceAtLeast(currentChunks.size),
+              updatedAtMs = System.currentTimeMillis(),
+              lastValidProgressAtMs = task.lastValidProgressAtMs,
+              measuredRtf = rtfEstimator.currentRtf(),
+            )
+          }
         }
       }
       throw e
@@ -1316,6 +1387,12 @@ class AudiobookGenerationOrchestrator(
       }
     dao.upsertChunks(freshChunks)
     return freshChunks
+  }
+
+  private fun isHealthyWavFile(file: File?): Boolean {
+    if (file == null || !WavAudioCodec.isValidWavFile(file)) return false
+    val info = WavAudioCodec.readWavInfo(file) ?: return false
+    return info.durationMs > 0L
   }
 
   private fun isAlreadyWavPayload(payload: SynthesizedAudioPayload): Boolean {

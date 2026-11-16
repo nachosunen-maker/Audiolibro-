@@ -30,18 +30,19 @@ import androidx.compose.ui.semantics.contentDescription
 import androidx.compose.ui.semantics.semantics
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import com.example.domain.model.NarrationEstimator
 import com.example.domain.model.ProgressiveChapterPhase
 
 /**
- * Barra multicapa basada exclusivamente en datos reales de síntesis y reproducción:
- * - Pista de fondo: total real del capítulo aún pendiente.
+ * Barra dedicada exclusivamente al progreso real de síntesis neuronal (ponderado por texto):
+ * - Pista de fondo: texto del capítulo pendiente de sintetizar.
  * - Capa preparada (secondary): fracción ya generada y verificada en disco.
  * - Capa activa (tertiary): fragmento actualmente sintetizándose por adelantado.
- * - Capa reproducida (primary): progreso reproducido sobre el audio ya preparado.
+ * - Capa opcional reproducida (primary): cuando se solicite vista combinada.
  */
 @Composable
 fun ProgressiveSegmentedBar(
-  playedFraction: Float,
+  playedFraction: Float = 0f,
   preparedFraction: Float,
   isGeneratingAhead: Boolean,
   isPaused: Boolean,
@@ -76,7 +77,7 @@ fun ProgressiveSegmentedBar(
         .clip(RoundedCornerShape(5.dp))
         .testTag("progressive_segmented_bar")
         .semantics {
-          contentDescription = "Progreso real de preparación y reproducción del capítulo"
+          contentDescription = "Progreso real de síntesis de texto del capítulo"
         }
   ) {
     val w = size.width
@@ -95,7 +96,7 @@ fun ProgressiveSegmentedBar(
       )
     }
 
-    // Audio preparado y verificado
+    // Audio sintetizado y verificado
     if (safePrepared > 0f) {
       drawRoundRect(
         color = preparedColor,
@@ -104,7 +105,7 @@ fun ProgressiveSegmentedBar(
       )
     }
 
-    // Audio ya reproducido
+    // Audio reproducido (si se muestra superpuesto)
     if (safePlayed > 0f) {
       drawRoundRect(
         color = playedColor,
@@ -112,6 +113,85 @@ fun ProgressiveSegmentedBar(
         size = Size(w * safePlayed, h),
         cornerRadius = radius,
       )
+    }
+  }
+}
+
+/**
+ * Indicador separado de disponibilidad de reproducción y búfer adelantado sobre el audio ya
+ * listo en disco (en tiempo real de audio, independiente del porcentaje de síntesis de texto).
+ */
+@Composable
+fun PlaybackAvailabilityBar(
+  playedDurationMs: Long,
+  bufferedDurationMs: Long,
+  aheadDurationMs: Long,
+  isWaitingForBuffer: Boolean,
+  modifier: Modifier = Modifier,
+) {
+  val safeBuffered = bufferedDurationMs.coerceAtLeast(0L)
+  val safePlayed = playedDurationMs.coerceIn(0L, safeBuffered)
+  val playedRatio =
+    if (safeBuffered > 0L) (safePlayed.toFloat() / safeBuffered.toFloat()).coerceIn(0f, 1f)
+    else 0f
+
+  val trackColor = MaterialTheme.colorScheme.surfaceVariant
+  val availableBufferColor =
+    if (isWaitingForBuffer) MaterialTheme.colorScheme.error.copy(alpha = 0.35f)
+    else MaterialTheme.colorScheme.secondaryContainer
+  val playedColor = MaterialTheme.colorScheme.primary
+
+  androidx.compose.foundation.layout.Column(
+    modifier = modifier.fillMaxWidth().testTag("playback_availability_section"),
+    verticalArrangement = Arrangement.spacedBy(4.dp),
+  ) {
+    Row(
+      modifier = Modifier.fillMaxWidth(),
+      horizontalArrangement = Arrangement.SpaceBetween,
+      verticalAlignment = Alignment.CenterVertically,
+    ) {
+      Text(
+        text =
+          if (isWaitingForBuffer) "Búfer agotado · sintetizando siguiente fragmento"
+          else "Búfer de reproducción disponible",
+        style = MaterialTheme.typography.labelSmall,
+        color =
+          if (isWaitingForBuffer) MaterialTheme.colorScheme.error
+          else MaterialTheme.colorScheme.onSurfaceVariant,
+      )
+      Text(
+        text =
+          "${NarrationEstimator.formatPlaybackTime(safePlayed)} / ${NarrationEstimator.formatPlaybackTime(safeBuffered)} · +${NarrationEstimator.formatPlaybackTime(aheadDurationMs.coerceAtLeast(0L))}",
+        style = MaterialTheme.typography.labelSmall.copy(fontWeight = FontWeight.SemiBold),
+        color = MaterialTheme.colorScheme.onSurface,
+      )
+    }
+    Canvas(
+      modifier =
+        Modifier
+          .fillMaxWidth()
+          .height(6.dp)
+          .clip(RoundedCornerShape(3.dp))
+          .testTag("playback_availability_bar")
+          .semantics {
+            contentDescription = "Disponibilidad de reproducción y búfer de audio preparado"
+          }
+    ) {
+      val w = size.width
+      val h = size.height
+      val radius = CornerRadius(h / 2f, h / 2f)
+      drawRoundRect(color = trackColor, size = Size(w, h), cornerRadius = radius)
+      if (safeBuffered > 0L) {
+        drawRoundRect(color = availableBufferColor, size = Size(w, h), cornerRadius = radius)
+      }
+      if (playedRatio > 0f) {
+        drawRoundRect(
+          color = playedColor,
+          topLeft = Offset.Zero,
+          size = Size(w * playedRatio, h),
+          cornerRadius = radius,
+        )
+      }
     }
   }
 }

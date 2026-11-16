@@ -255,6 +255,38 @@ class PiperAudioSynthesisProviderTest {
     assertTrue(res.exceptionOrNull()?.message?.contains("Fallo simulado") == true)
   }
 
+  @Test
+  fun `provider rejects pure silence or NaN output instead of generating empty silent WAV`() = runTest {
+    assertFalse(PiperAudioSignalValidator.hasAudibleSignal(FloatArray(0)))
+    assertFalse(PiperAudioSignalValidator.hasAudibleSignal(FloatArray(2048) { 0f }))
+    assertFalse(PiperAudioSignalValidator.hasAudibleSignal(floatArrayOf(0f, Float.NaN, 0.2f)))
+    assertTrue(PiperAudioSignalValidator.hasAudibleSignal(floatArrayOf(0f, 0.25f, -0.25f)))
+
+    val silentEngine =
+      object : LocalTtsEngine {
+        override fun isModelReady(): Boolean = true
+        override fun initialize() {}
+        override fun sampleRate(): Int = 22_050
+        override fun numSpeakers(): Int = 2
+        override fun generate(text: String, speakerId: Int, speed: Float): LocalTtsAudio =
+          LocalTtsAudio(FloatArray(2205) { 0f }, 22_050)
+        override fun release() {}
+      }
+
+    val provider = PiperAudioSynthesisProvider(context, silentEngine)
+    val res =
+      provider.synthesizeFragment(
+        text = "Texto que no debe terminar en silencio absoluto.",
+        voice = NarratorVoice.FEMALE,
+        bookTitle = "Libro",
+        chapterTitle = "Cap 1",
+      )
+    assertTrue(res.isFailure)
+    assertTrue(
+      res.exceptionOrNull()?.message?.contains("silencio", ignoreCase = true) == true
+    )
+  }
+
   private class RecordingFakeLocalTtsEngine : LocalTtsEngine {
     var initCalls = 0
     var releaseCalls = 0

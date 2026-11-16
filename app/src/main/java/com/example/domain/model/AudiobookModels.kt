@@ -60,6 +60,7 @@ enum class GenerationTaskStatus {
   RUNNING,
   INTERRUPTED_BY_OS,
   PAUSED_BY_USER,
+  CANCELLED,
   COMPLETED,
   ERROR;
 

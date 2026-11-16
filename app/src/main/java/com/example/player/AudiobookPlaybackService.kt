@@ -39,10 +39,21 @@ class AudiobookPlaybackService : MediaSessionService() {
   private var mediaSession: MediaSession? = null
   private var tickerJob: Job? = null
   private var lastPersistenceJob: Job? = null
+  private var progressiveObserverJob: Job? = null
+  private var activeProgressiveKey: Pair<String, Int>? = null
+  private var activeProgressiveTotalChunks: Int = 0
+  private var shouldResumeAfterBufferDepletion: Boolean = false
+  private var lastDbPersistAtMs: Long = 0L
 
   private val servicePlayerListener =
     object : Player.Listener {
       override fun onIsPlayingChanged(isPlaying: Boolean) {
+        val player = mediaSession?.player
+        if (!isPlaying && player != null && !player.playWhenReady) {
+          shouldResumeAfterBufferDepletion = false
+        }
+        syncProgressiveObserverFromPlayer()
+        notifyProgressiveEngineFromPlayer()
         if (isPlaying) {
           startPersistenceTicker()
         } else {
@@ -51,12 +62,36 @@ class AudiobookPlaybackService : MediaSessionService() {
         }
       }
 
+      override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+        if (!playWhenReady) {
+          shouldResumeAfterBufferDepletion = false
+        }
+        notifyProgressiveEngineFromPlayer()
+      }
+
       override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+        syncProgressiveObserverFromPlayer()
+        notifyProgressiveEngineFromPlayer()
         persistPlayerPositionSnapshot()
       }
 
       override fun onPlaybackStateChanged(playbackState: Int) {
+        val player = mediaSession?.player
+        if (playbackState == Player.STATE_ENDED && player != null) {
+          val extras = player.currentMediaItem?.mediaMetadata?.extras
+          val isProgressive =
+            extras?.getBoolean(AudiobookMediaHelper.EXTRA_IS_PROGRESSIVE_CHUNK, false) == true
+          if (isProgressive &&
+            activeProgressiveTotalChunks > 0 &&
+            player.mediaItemCount < activeProgressiveTotalChunks &&
+            player.playWhenReady
+          ) {
+            shouldResumeAfterBufferDepletion = true
+          }
+        }
         if (playbackState == Player.STATE_ENDED || playbackState == Player.STATE_READY) {
+          syncProgressiveObserverFromPlayer()
+          notifyProgressiveEngineFromPlayer()
           persistPlayerPositionSnapshot()
         }
       }
@@ -67,6 +102,7 @@ class AudiobookPlaybackService : MediaSessionService() {
         reason: Int,
       ) {
         if (reason == Player.DISCONTINUITY_REASON_SEEK) {
+          notifyProgressiveEngineFromPlayer()
           persistPlayerPositionSnapshot()
         }
       }
@@ -96,20 +132,48 @@ class AudiobookPlaybackService : MediaSessionService() {
               return@launch
             }
             val playableChapters = AudiobookMediaHelper.buildPlayableChapters(lastBook.chapters)
-            if (playableChapters.isEmpty()) {
-              future.setException(
-                IllegalStateException("El último audiolibro no tiene capítulos listos.")
+            val targetChapterIndex =
+              lastBook.book.lastPlayedChapterIndex
+                ?: playableChapters.firstOrNull()?.chapterIndex
+                ?: lastBook.chapters.firstOrNull { it.generatedChunks > 0 }?.chapterIndex
+            val readyMatch =
+              playableChapters.firstOrNull { it.chapterIndex == targetChapterIndex }
+
+            if (readyMatch != null) {
+              val startIndex =
+                playableChapters.indexOfFirst { it.chapterIndex == readyMatch.chapterIndex }.coerceAtLeast(0)
+              val startPositionMs = lastBook.book.lastPlayedPositionMs.coerceAtLeast(0L)
+              val mediaItems = AudiobookMediaHelper.buildMediaItems(lastBook.book, playableChapters)
+              future.set(
+                MediaSession.MediaItemsWithStartPosition(mediaItems, startIndex, startPositionMs)
               )
               return@launch
             }
-            val targetChapterIndex =
-              lastBook.book.lastPlayedChapterIndex ?: playableChapters.first().chapterIndex
-            val startIndex =
-              playableChapters.indexOfFirst { it.chapterIndex == targetChapterIndex }.coerceAtLeast(0)
-            val startPositionMs = lastBook.book.lastPlayedPositionMs.coerceAtLeast(0L)
-            val mediaItems = AudiobookMediaHelper.buildMediaItems(lastBook.book, playableChapters)
-            future.set(
-              MediaSession.MediaItemsWithStartPosition(mediaItems, startIndex, startPositionMs)
+
+            val progressiveTarget =
+              lastBook.chapters.firstOrNull { it.chapterIndex == targetChapterIndex }
+                ?: lastBook.chapters.firstOrNull { it.generatedChunks > 0 }
+            if (progressiveTarget != null) {
+              val savedChunks = repository.getCompletedValidChunksOnce(progressiveTarget.id)
+              if (savedChunks.isNotEmpty()) {
+                val (chunkIdx, offsetMs) =
+                  AudiobookMediaHelper.resolveChunkPositionOffset(
+                    savedChunks,
+                    lastBook.book.lastPlayedPositionMs.coerceAtLeast(0L),
+                  )
+                val items =
+                  AudiobookMediaHelper.buildProgressiveMediaItems(
+                    lastBook.book,
+                    progressiveTarget,
+                    savedChunks,
+                  )
+                future.set(MediaSession.MediaItemsWithStartPosition(items, chunkIdx, offsetMs))
+                return@launch
+              }
+            }
+
+            future.setException(
+              IllegalStateException("El último audiolibro no tiene capítulos listos.")
             )
           } catch (t: Throwable) {
             future.setException(t)
@@ -173,11 +237,13 @@ class AudiobookPlaybackService : MediaSessionService() {
 
   override fun onTaskRemoved(rootIntent: Intent?) {
     val player = mediaSession?.player
+    val awaitingMoreChunks = shouldResumeAfterBufferDepletion && activeProgressiveKey != null
     if (
       player == null ||
-        !player.playWhenReady ||
-        player.mediaItemCount == 0 ||
-        player.playbackState == Player.STATE_ENDED
+        (!awaitingMoreChunks &&
+          (!player.playWhenReady ||
+            player.mediaItemCount == 0 ||
+            player.playbackState == Player.STATE_ENDED))
     ) {
       persistPlayerPositionSnapshot()
       stopSelf()
@@ -186,6 +252,9 @@ class AudiobookPlaybackService : MediaSessionService() {
 
   override fun onDestroy() {
     stopPersistenceTicker()
+    progressiveObserverJob?.cancel()
+    progressiveObserverJob = null
+    activeProgressiveKey = null
     persistPlayerPositionSnapshot()
     mediaSession?.run {
       player.removeListener(servicePlayerListener)
@@ -210,13 +279,131 @@ class AudiobookPlaybackService : MediaSessionService() {
     lastPersistenceJob?.join()
   }
 
+  private fun syncProgressiveObserverFromPlayer() {
+    val player = mediaSession?.player ?: return
+    val extras = player.currentMediaItem?.mediaMetadata?.extras
+    val isProgressive =
+      extras?.getBoolean(AudiobookMediaHelper.EXTRA_IS_PROGRESSIVE_CHUNK, false) == true
+    val bookId = extras?.getString(AudiobookMediaHelper.EXTRA_BOOK_ID)?.takeIf { it.isNotBlank() }
+    val chapterIndex = extras?.getInt(AudiobookMediaHelper.EXTRA_CHAPTER_INDEX, -1) ?: -1
+
+    if (!isProgressive || bookId == null || chapterIndex < 0) {
+      if (activeProgressiveKey != null) {
+        progressiveObserverJob?.cancel()
+        progressiveObserverJob = null
+        activeProgressiveKey = null
+        activeProgressiveTotalChunks = 0
+        shouldResumeAfterBufferDepletion = false
+      }
+      return
+    }
+
+    val key = bookId to chapterIndex
+    if (activeProgressiveKey == key && progressiveObserverJob?.isActive == true) {
+      return
+    }
+
+    progressiveObserverJob?.cancel()
+    activeProgressiveKey = key
+    progressiveObserverJob =
+      serviceScope.launch {
+        val loaded = repository.getBookWithChaptersOnce(bookId) ?: return@launch
+        val chapterWithChunks =
+          repository.getChapterWithChunksOnce(bookId, chapterIndex) ?: return@launch
+        val book = loaded.book
+        val chapter = chapterWithChunks.first
+        activeProgressiveTotalChunks = chapter.totalChunks
+
+        repository.observeChunksForChapter(chapter.id).collect { latestEntities ->
+          val activePlayer = mediaSession?.player ?: return@collect
+          val currentExtras = activePlayer.currentMediaItem?.mediaMetadata?.extras
+          if (
+            currentExtras?.getBoolean(AudiobookMediaHelper.EXTRA_IS_PROGRESSIVE_CHUNK, false) != true ||
+              currentExtras.getString(AudiobookMediaHelper.EXTRA_BOOK_ID) != bookId ||
+              currentExtras.getInt(AudiobookMediaHelper.EXTRA_CHAPTER_INDEX, -1) != chapterIndex
+          ) {
+            return@collect
+          }
+
+          val validContiguous =
+            AudiobookMediaHelper.extractContiguousValidChunks(
+              latestEntities.filter { it.voiceName == book.selectedVoice.name }
+            )
+          if (validContiguous.isEmpty()) return@collect
+
+          val existingIds =
+            (0 until activePlayer.mediaItemCount).mapTo(HashSet()) { idx ->
+              activePlayer.getMediaItemAt(idx).mediaId
+            }
+          val missingTailChunks =
+            validContiguous.filter { chunk ->
+              val expectedId = "${book.id}:${chapter.chapterIndex}:chunk:${chunk.chunkIndex}"
+              !existingIds.contains(expectedId)
+            }
+
+          if (missingTailChunks.isNotEmpty()) {
+            val previousCount = activePlayer.mediaItemCount
+            val itemsToAdd =
+              AudiobookMediaHelper.buildProgressiveMediaItems(book, chapter, missingTailChunks)
+            activePlayer.addMediaItems(itemsToAdd)
+
+            val hitEndWhilePlaying =
+              shouldResumeAfterBufferDepletion ||
+                (activePlayer.playbackState == Player.STATE_ENDED && activePlayer.playWhenReady)
+            if (hitEndWhilePlaying && previousCount < activePlayer.mediaItemCount) {
+              shouldResumeAfterBufferDepletion = false
+              activePlayer.seekTo(previousCount, 0L)
+              activePlayer.prepare()
+              activePlayer.play()
+            }
+          }
+        }
+      }
+  }
+
+  private fun notifyProgressiveEngineFromPlayer() {
+    val player = mediaSession?.player ?: return
+    val extras = player.currentMediaItem?.mediaMetadata?.extras ?: return
+    if (!extras.getBoolean(AudiobookMediaHelper.EXTRA_IS_PROGRESSIVE_CHUNK, false)) return
+    val bookId = extras.getString(AudiobookMediaHelper.EXTRA_BOOK_ID)?.takeIf { it.isNotBlank() } ?: return
+    val chapterIndex = extras.getInt(AudiobookMediaHelper.EXTRA_CHAPTER_INDEX, -1)
+    if (chapterIndex < 0) return
+
+    val cumulativePos = computeProgressiveChapterPositionMs(player)
+    val speed = runCatching { player.playbackParameters.speed }.getOrDefault(1.0f)
+    repository.notifyProgressivePlaybackState(
+      bookId = bookId,
+      chapterIndex = chapterIndex,
+      chapterPositionMs = cumulativePos,
+      isPlaying = player.isPlaying,
+      playbackSpeed = speed,
+    )
+  }
+
+  private fun computeProgressiveChapterPositionMs(player: Player): Long {
+    val currentIdx = player.currentMediaItemIndex.coerceAtLeast(0)
+    var prefixMs = 0L
+    for (i in 0 until currentIdx.coerceAtMost(player.mediaItemCount)) {
+      val itemExtras = player.getMediaItemAt(i).mediaMetadata.extras
+      val chunkDur = itemExtras?.getLong(AudiobookMediaHelper.EXTRA_CHUNK_DURATION_MS, 0L) ?: 0L
+      prefixMs += chunkDur.coerceAtLeast(0L)
+    }
+    return prefixMs + player.currentPosition.coerceAtLeast(0L)
+  }
+
   private fun startPersistenceTicker() {
     if (tickerJob?.isActive == true) return
+    lastDbPersistAtMs = 0L
     tickerJob =
       serviceScope.launch {
         while (isActive) {
-          persistPlayerPositionSnapshot()
-          delay(POSITION_SAVE_INTERVAL_MS)
+          notifyProgressiveEngineFromPlayer()
+          val now = System.currentTimeMillis()
+          if (now - lastDbPersistAtMs >= POSITION_SAVE_INTERVAL_MS) {
+            persistPlayerPositionSnapshot()
+            lastDbPersistAtMs = now
+          }
+          delay(PROGRESSIVE_HEARTBEAT_INTERVAL_MS)
         }
       }
   }
@@ -234,7 +421,13 @@ class AudiobookPlaybackService : MediaSessionService() {
       ?: return
     val chapterIndex = extras.getInt(AudiobookMediaHelper.EXTRA_CHAPTER_INDEX, -1)
     if (chapterIndex < 0) return
-    val positionMs = player.currentPosition.coerceAtLeast(0L)
+    val isProgressive = extras.getBoolean(AudiobookMediaHelper.EXTRA_IS_PROGRESSIVE_CHUNK, false)
+    val positionMs =
+      if (isProgressive) {
+        computeProgressiveChapterPositionMs(player)
+      } else {
+        player.currentPosition.coerceAtLeast(0L)
+      }
     lastPersistenceJob =
       persistenceScope.launch {
         runCatching { repository.updatePlaybackPosition(bookId, chapterIndex, positionMs) }
@@ -245,5 +438,6 @@ class AudiobookPlaybackService : MediaSessionService() {
     const val SESSION_ID = "audiolibro_media_session"
     const val CHANNEL_ID_PLAYBACK = "audiolibro_playback_channel"
     private const val POSITION_SAVE_INTERVAL_MS = 3_000L
+    private const val PROGRESSIVE_HEARTBEAT_INTERVAL_MS = 1_000L
   }
 }

@@ -41,8 +41,10 @@ import com.example.epub.EpubParseException
 import com.example.epub.EpubParser
 import java.io.File
 import java.util.UUID
+import java.util.concurrent.ConcurrentHashMap
 import java.util.concurrent.atomic.AtomicBoolean
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.CompletableDeferred
 import kotlinx.coroutines.CoroutineExceptionHandler
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.CoroutineStart
@@ -58,7 +60,6 @@ import kotlinx.coroutines.flow.combine
 import kotlinx.coroutines.flow.map
 import kotlinx.coroutines.flow.update
 import kotlinx.coroutines.launch
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import kotlinx.coroutines.withContext
@@ -94,11 +95,20 @@ class AudiobookRepository(
   private val taskPersistenceParentJob = SupervisorJob()
   private val taskPersistenceScope = CoroutineScope(taskPersistenceParentJob + Dispatchers.IO)
   private val taskDbMutex = Mutex()
+  private val taskPersistenceChannel = Channel<TaskPersistenceOp>(Channel.UNLIMITED)
+  private val pausedBookIds = ConcurrentHashMap.newKeySet<String>()
+  private val cancelledBookIds = ConcurrentHashMap.newKeySet<String>()
   private val queueLock = Any()
   private val pendingBookIds = ArrayDeque<String>()
   @Volatile private var activeBookId: String? = null
   @Volatile private var activeJob: Job? = null
   private val osTimeoutInProgress = AtomicBoolean(false)
+
+  private sealed interface TaskPersistenceOp {
+    data class Run(val block: suspend () -> Unit) : TaskPersistenceOp
+
+    data class Flush(val ack: CompletableDeferred<Unit>) : TaskPersistenceOp
+  }
 
   private val _generationProgress =
     MutableStateFlow<Map<String, BookGenerationProgress>>(emptyMap())
@@ -117,6 +127,23 @@ class AudiobookRepository(
   private val _progressiveChapterState = MutableStateFlow<ProgressiveChapterState?>(null)
   val progressiveChapterState: StateFlow<ProgressiveChapterState?> =
     _progressiveChapterState.asStateFlow()
+
+  init {
+    taskPersistenceScope.launch {
+      for (op in taskPersistenceChannel) {
+        when (op) {
+          is TaskPersistenceOp.Run ->
+            taskDbMutex.withLock {
+              runCatching { op.block() }
+                .onFailure { err ->
+                  Log.e(TAG_GEN, "Error en operación secuencial de persistencia", err)
+                }
+            }
+          is TaskPersistenceOp.Flush -> op.ack.complete(Unit)
+        }
+      }
+    }
+  }
 
   fun observeBooks(): Flow<List<Book>> = dao.observeBooks().map { list -> list.map { it.toDomain() } }
 
@@ -272,9 +299,11 @@ class AudiobookRepository(
     Log.i(TAG_GEN, "requestAudiobookGeneration(bookId=$bookId) -> iniciando servicio en primer plano")
     stopProgressiveGenerationForBook(bookId = null, reasonPauseOnly = true)
     osTimeoutInProgress.set(false)
+    pausedBookIds.remove(bookId)
+    cancelledBookIds.remove(bookId)
     clearGenerationError(bookId)
 
-    taskPersistenceScope.launch {
+    enqueuePersistenceOp {
       persistQueuedTaskLocked(bookId, forceQueuedStatus = true)
     }
 
@@ -315,8 +344,10 @@ class AudiobookRepository(
     // Garantiza un único motor Piper/ONNX activo evitando generaciones simultáneas en competencia.
     val fullBookRunning = hasActiveOrQueuedGenerations()
     if (fullBookRunning) {
-      cancelAllGenerations()
+      pauseAllGenerations()
     }
+    pausedBookIds.remove(bookId)
+    cancelledBookIds.remove(bookId)
 
     val key = bookId to chapterIndex
     synchronized(progressiveLock) {
@@ -357,6 +388,7 @@ class AudiobookRepository(
             playbackStateProvider = { progressivePlaybackSnapshot },
             isPausedProvider = { progressivePausedByUser },
             sessionActiveProvider = { progressiveUiActive },
+            cancellationStatusProvider = ::resolveCancellationTaskStatus,
             awaitSignal = { progressiveSignalChannel.receive() },
             onProgressiveState = { state -> _progressiveChapterState.value = state },
           )
@@ -387,17 +419,15 @@ class AudiobookRepository(
     }
     val cur = _progressiveChapterState.value
     if (cur != null && !cur.isCompleteChapterReady) {
-      taskPersistenceScope.launch {
-        taskDbMutex.withLock {
-          val task = dao.getGenerationTaskOnce(cur.bookId)
-          if (task != null && task.parsedStatus() != GenerationTaskStatus.COMPLETED) {
-            dao.updateGenerationTaskStatus(
-              bookId = cur.bookId,
-              status = GenerationTaskStatus.PAUSED_BY_USER.name,
-              updatedAtMs = System.currentTimeMillis(),
-              errorMessage = null,
-            )
-          }
+      enqueuePersistenceOp {
+        val task = dao.getGenerationTaskOnce(cur.bookId)
+        if (task != null && task.parsedStatus() != GenerationTaskStatus.COMPLETED) {
+          dao.updateGenerationTaskStatus(
+            bookId = cur.bookId,
+            status = GenerationTaskStatus.PAUSED_BY_USER.name,
+            updatedAtMs = System.currentTimeMillis(),
+            errorMessage = null,
+          )
         }
       }
     }
@@ -504,36 +534,80 @@ class AudiobookRepository(
       val chapters = dao.getChaptersOnce(bookId).sortedBy { it.chapterIndex }
       val pos = chapters.indexOfFirst { it.chapterIndex == chapterIndex }
       val chapter = chapters.getOrNull(pos) ?: return@withContext
+      val voice = NarratorVoice.fromNameOrDefault(book.selectedVoice)
       val task = dao.getGenerationTaskOnce(bookId)
       if (!progressiveRtfEstimator.hasMeasurement() && (task?.measuredRtf ?: 0f) > 0f) {
         progressiveRtfEstimator = RtfEstimator(task!!.measuredRtf)
       }
       val profile = DeviceCapabilityInspector.inspect(context)
       val existingChunks = dao.getChunksForChapterOnce(chapter.id).sortedBy { it.chunkIndex }
+      val matchingChunks = existingChunks.filter { it.voiceName == voice.name }
+      val voiceMatches = existingChunks.isEmpty() || matchingChunks.size == existingChunks.size
+
+      val chapterFile = chapter.audioFilePath?.let(::File)
+      val chapterWavInfo = chapterFile?.let { WavAudioCodec.readWavInfo(it) }
+      val healthyChapterWav = chapterWavInfo != null && chapterWavInfo.durationMs > 0L
+      val isReady =
+        chapter.audioStatus == AudioGenerationStatus.READY.name && healthyChapterWav && voiceMatches
+
+      val contiguousReady =
+        if (voiceMatches) {
+          matchingChunks.takeWhile {
+            it.status == ChapterChunkStatus.COMPLETED.name &&
+              !it.wavFilePath.isNullOrBlank() &&
+              (WavAudioCodec.readWavInfo(File(it.wavFilePath))?.durationMs ?: 0L) > 0L
+          }
+        } else {
+          emptyList()
+        }
+
+      if (chapter.audioStatus == AudioGenerationStatus.READY.name && !isReady) {
+        val validCount =
+          if (voiceMatches) {
+            matchingChunks.count {
+              it.status == ChapterChunkStatus.COMPLETED.name &&
+                !it.wavFilePath.isNullOrBlank() &&
+                (WavAudioCodec.readWavInfo(File(it.wavFilePath))?.durationMs ?: 0L) > 0L
+            }
+          } else {
+            0
+          }
+        dao.updateChapterAudioState(
+          chapterId = chapter.id,
+          audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
+          audioFilePath = null,
+          audioDurationMs = 0L,
+          audioSizeBytes = 0L,
+          generatedChunks = validCount,
+          totalChunks = if (voiceMatches) existingChunks.size else 0,
+          generationError = null,
+        )
+      }
+
       val totalChars =
-        if (existingChunks.isNotEmpty()) {
-          ProgressiveChapterProgressCalculator.calculateTotalChars(existingChunks)
+        if (voiceMatches && matchingChunks.isNotEmpty()) {
+          ProgressiveChapterProgressCalculator.calculateTotalChars(matchingChunks)
         } else {
           chapter.characterCount.coerceAtLeast(chapter.contentText.length)
         }
-      val isReady = chapter.audioStatus == AudioGenerationStatus.READY.name && !chapter.audioFilePath.isNullOrBlank()
       val synthesizedChars =
         if (isReady) {
           totalChars
+        } else if (voiceMatches) {
+          ProgressiveChapterProgressCalculator.calculateSynthesizedChars(matchingChunks)
         } else {
-          ProgressiveChapterProgressCalculator.calculateSynthesizedChars(existingChunks)
-        }
-      val contiguousReady =
-        existingChunks.takeWhile {
-          it.status == ChapterChunkStatus.COMPLETED.name &&
-            !it.wavFilePath.isNullOrBlank() &&
-            WavAudioCodec.isValidWavFile(File(it.wavFilePath))
+          0
         }
       val bufferedMs = contiguousReady.sumOf { it.durationMs.coerceAtLeast(0L) }
-      val totalChunks = chapter.totalChunks.coerceAtLeast(existingChunks.size)
+      val totalChunks =
+        if (voiceMatches) chapter.totalChunks.coerceAtLeast(matchingChunks.size) else 0
       val snap = progressivePlaybackSnapshot
-      val playedMs = if (snap.bookId == bookId && snap.chapterIndex == chapterIndex) snap.playedPositionMs else book.lastPlayedPositionMs
-      val aheadMs = (bufferedMs - playedMs).coerceAtLeast(0L)
+      val playedMs =
+        if (snap.bookId == bookId && snap.chapterIndex == chapterIndex) snap.playedPositionMs
+        else book.lastPlayedPositionMs
+      val aheadMs =
+        if (isReady) ((chapterWavInfo?.durationMs ?: chapter.audioDurationMs).coerceAtLeast(bufferedMs) - playedMs).coerceAtLeast(0L)
+        else (bufferedMs - playedMs).coerceAtLeast(0L)
       val remaining = (totalChunks - contiguousReady.size).coerceAtLeast(0)
       val decision =
         AdaptiveBufferPolicy.evaluate(
@@ -575,7 +649,9 @@ class AudiobookRepository(
           totalChunks = totalChunks,
           initialReadyTargetMs = decision.initialReadyTargetMs,
           aheadLookaheadTargetMs = decision.aheadLookaheadTargetMs,
-          bufferedDurationMs = if (isReady) chapter.audioDurationMs.coerceAtLeast(bufferedMs) else bufferedMs,
+          bufferedDurationMs =
+            if (isReady) (chapterWavInfo?.durationMs ?: chapter.audioDurationMs).coerceAtLeast(bufferedMs)
+            else bufferedMs,
           playedDurationMs = playedMs,
           aheadDurationMs = aheadMs,
           initialReadinessFraction = if (isReady) 1f else decision.initialReadinessFraction,
@@ -625,6 +701,8 @@ class AudiobookRepository(
 
   fun enqueueAudiobookGeneration(bookId: String) {
     osTimeoutInProgress.set(false)
+    pausedBookIds.remove(bookId)
+    cancelledBookIds.remove(bookId)
     val shouldLaunch =
       synchronized(queueLock) {
         if (activeBookId == bookId && activeJob?.isActive == true) {
@@ -652,7 +730,7 @@ class AudiobookRepository(
         activeJob?.isActive != true
       }
 
-    taskPersistenceScope.launch {
+    enqueuePersistenceOp {
       persistQueuedTaskLocked(bookId, forceQueuedStatus = false)
     }
 
@@ -685,6 +763,8 @@ class AudiobookRepository(
 
       val now = System.currentTimeMillis()
       for (task in recoverable) {
+        pausedBookIds.remove(task.bookId)
+        cancelledBookIds.remove(task.bookId)
         if (task.parsedStatus() == GenerationTaskStatus.RUNNING || task.parsedStatus() == GenerationTaskStatus.INTERRUPTED_BY_OS) {
           taskDbMutex.withLock {
             dao.updateGenerationTaskStatus(
@@ -747,9 +827,9 @@ class AudiobookRepository(
       true
     }
 
-  internal fun tryStartForegroundServiceForRecovery(): Boolean {
+  internal suspend fun tryStartForegroundServiceForRecovery(): Boolean {
     val firstBookId =
-      runBlocking {
+      withContext(Dispatchers.IO) {
         taskDbMutex.withLock { dao.getRecoverableGenerationTasksOnce().firstOrNull()?.bookId }
       } ?: return false
     return runCatching {
@@ -777,12 +857,14 @@ class AudiobookRepository(
         pendingBookIds.clear()
         Pair(ids.distinct(), activeJob)
       }
+    affected.first.forEach { id ->
+      pausedBookIds.remove(id)
+      cancelledBookIds.remove(id)
+    }
 
     val now = System.currentTimeMillis()
-    runBlocking(Dispatchers.IO) {
-      taskDbMutex.withLock {
-        dao.markRunningTasksInterruptedByOs(now)
-      }
+    enqueuePersistenceOp {
+      dao.markRunningTasksInterruptedByOs(now)
     }
 
     affected.second?.cancel(CancellationException("OS_FGS_TIMEOUT"))
@@ -819,9 +901,14 @@ class AudiobookRepository(
     if (hasActiveOrQueuedGenerations()) return ListenableWorker.Result.success()
 
     for (task in tasks) {
+      pausedBookIds.remove(task.bookId)
+      cancelledBookIds.remove(task.bookId)
       val result =
         try {
-          orchestrator.generateBookAudiobook(task.bookId) { progress ->
+          orchestrator.generateBookAudiobook(
+            bookId = task.bookId,
+            cancellationStatusProvider = ::resolveCancellationTaskStatus,
+          ) { progress ->
             _generationProgress.update { map -> map + (task.bookId to progress) }
           }
         } catch (e: CancellationException) {
@@ -886,7 +973,10 @@ class AudiobookRepository(
       generationScope.launch(start = CoroutineStart.LAZY) {
         try {
           val result =
-            orchestrator.generateBookAudiobook(nextBookId) { progress ->
+            orchestrator.generateBookAudiobook(
+              bookId = nextBookId,
+              cancellationStatusProvider = ::resolveCancellationTaskStatus,
+            ) { progress ->
               _generationProgress.update { map -> map + (nextBookId to progress) }
             }
           result.onFailure { err ->
@@ -915,21 +1005,32 @@ class AudiobookRepository(
         } catch (e: CancellationException) {
           Log.i(TAG_GEN, "Generación interrumpida/pausada para bookId=$nextBookId")
           val pausedByOsTimeout = osTimeoutInProgress.get()
+          val cancelledByUser = cancelledBookIds.contains(nextBookId)
           _generationProgress.update { map ->
             val current = map[nextBookId]
             if (current != null) {
-              map +
-                (nextBookId to
-                  current.copy(
-                    isRunning = false,
-                    phase = GenerationPhase.INTERRUPTED,
-                    statusMessage =
-                      if (pausedByOsTimeout) {
-                        "Límite temporal del sistema alcanzado. Se reanudará automáticamente."
-                      } else {
-                        "Generación pausada. El progreso guardado se conserva."
-                      },
-                  ))
+              if (cancelledByUser) {
+                map +
+                  (nextBookId to
+                    current.copy(
+                      isRunning = false,
+                      phase = GenerationPhase.IDLE,
+                      statusMessage = "Generación cancelada.",
+                    ))
+              } else {
+                map +
+                  (nextBookId to
+                    current.copy(
+                      isRunning = false,
+                      phase = GenerationPhase.INTERRUPTED,
+                      statusMessage =
+                        if (pausedByOsTimeout) {
+                          "Límite temporal del sistema alcanzado. Se reanudará automáticamente."
+                        } else {
+                          "Generación en pausa. El progreso guardado se conserva."
+                        },
+                    ))
+              }
             } else {
               map
             }
@@ -997,36 +1098,34 @@ class AudiobookRepository(
     job.start()
   }
 
-  fun cancelAudiobookGeneration(bookId: String) {
+  fun pauseAudiobookGeneration(bookId: String) {
+    pausedBookIds.add(bookId)
+    cancelledBookIds.remove(bookId)
     val jobToCancel =
       synchronized(queueLock) {
         pendingBookIds.remove(bookId)
         if (activeBookId == bookId) activeJob else null
       }
 
-    // Persistir PAUSED_BY_USER antes de cancelar la corrutina y sin dejar operaciones Room
-    // asíncronas huérfanas para que la cola persistente distinga la pausa explícita del usuario.
-    runBlocking(Dispatchers.IO) {
-      awaitPersistenceJobs()
-      val anyOtherRecoverable =
-        taskDbMutex.withLock {
-          val existing = dao.getGenerationTaskOnce(bookId)
-          if (existing != null) {
-            dao.updateGenerationTaskStatus(
-              bookId = bookId,
-              status = GenerationTaskStatus.PAUSED_BY_USER.name,
-              updatedAtMs = System.currentTimeMillis(),
-              errorMessage = null,
-            )
-          }
-          dao.getRecoverableGenerationTasksOnce().isNotEmpty()
-        }
-      if (!anyOtherRecoverable) {
+    enqueuePersistenceOp {
+      val existing = dao.getGenerationTaskOnce(bookId)
+      if (existing != null &&
+        existing.parsedStatus() != GenerationTaskStatus.COMPLETED &&
+        existing.parsedStatus() != GenerationTaskStatus.ERROR
+      ) {
+        dao.updateGenerationTaskStatus(
+          bookId = bookId,
+          status = GenerationTaskStatus.PAUSED_BY_USER.name,
+          updatedAtMs = System.currentTimeMillis(),
+          errorMessage = null,
+        )
+      }
+      if (dao.getRecoverableGenerationTasksOnce().isEmpty()) {
         AudiobookRecoveryScheduler.cancelRecovery(context.applicationContext)
       }
     }
 
-    jobToCancel?.cancel()
+    jobToCancel?.cancel(CancellationException("USER_PAUSED"))
     _generationProgress.update { map ->
       val current = map[bookId]
       if (current != null) {
@@ -1035,7 +1134,117 @@ class AudiobookRepository(
             current.copy(
               isRunning = false,
               phase = GenerationPhase.INTERRUPTED,
-              statusMessage = "Generación pausada por el usuario. El progreso guardado se conserva.",
+              statusMessage = "Generación en pausa. El progreso guardado se conserva.",
+            ))
+      } else {
+        map
+      }
+    }
+  }
+
+  fun pauseAllGenerations() {
+    val active =
+      synchronized(queueLock) {
+        val ids = pendingBookIds.toList()
+        pendingBookIds.clear()
+        val runningId = activeBookId
+        Pair((ids + listOfNotNull(runningId)).distinct(), activeJob)
+      }
+
+    active.first.forEach { id ->
+      pausedBookIds.add(id)
+      cancelledBookIds.remove(id)
+    }
+
+    enqueuePersistenceOp {
+      val now = System.currentTimeMillis()
+      for (id in active.first) {
+        val existing = dao.getGenerationTaskOnce(id)
+        if (existing != null &&
+          existing.parsedStatus() != GenerationTaskStatus.COMPLETED &&
+          existing.parsedStatus() != GenerationTaskStatus.ERROR
+        ) {
+          dao.updateGenerationTaskStatus(
+            bookId = id,
+            status = GenerationTaskStatus.PAUSED_BY_USER.name,
+            updatedAtMs = now,
+            errorMessage = null,
+          )
+        }
+      }
+      AudiobookRecoveryScheduler.cancelRecovery(context.applicationContext)
+    }
+
+    active.second?.cancel(CancellationException("USER_PAUSED"))
+    _generationProgress.update { map ->
+      var updated = map
+      for (id in active.first) {
+        val cur = updated[id]
+        if (cur != null) {
+          updated =
+            updated +
+              (id to
+                cur.copy(
+                  isRunning = false,
+                  phase = GenerationPhase.INTERRUPTED,
+                  statusMessage = "Generación en pausa. El progreso guardado se conserva.",
+                ))
+        }
+      }
+      updated
+    }
+  }
+
+  fun cancelAudiobookGeneration(bookId: String) {
+    cancelledBookIds.add(bookId)
+    pausedBookIds.remove(bookId)
+    val jobToCancel =
+      synchronized(queueLock) {
+        pendingBookIds.remove(bookId)
+        if (activeBookId == bookId) activeJob else null
+      }
+
+    enqueuePersistenceOp {
+      storageManager.cleanOrphanedTempFiles(bookId)
+      val existing = dao.getGenerationTaskOnce(bookId)
+      if (existing != null && existing.parsedStatus() != GenerationTaskStatus.COMPLETED) {
+        dao.updateGenerationTaskStatus(
+          bookId = bookId,
+          status = GenerationTaskStatus.CANCELLED.name,
+          updatedAtMs = System.currentTimeMillis(),
+          errorMessage = null,
+        )
+      }
+      val chapters = dao.getChaptersOnce(bookId)
+      for (ch in chapters) {
+        if (ch.audioStatus == AudioGenerationStatus.GENERATING.name) {
+          dao.updateChapterAudioState(
+            chapterId = ch.id,
+            audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
+            audioFilePath = null,
+            audioDurationMs = 0L,
+            audioSizeBytes = 0L,
+            generatedChunks = ch.generatedChunks,
+            totalChunks = ch.totalChunks,
+            generationError = null,
+          )
+        }
+      }
+      if (dao.getRecoverableGenerationTasksOnce().isEmpty()) {
+        AudiobookRecoveryScheduler.cancelRecovery(context.applicationContext)
+      }
+    }
+
+    jobToCancel?.cancel(CancellationException("USER_CANCELLED"))
+    _generationProgress.update { map ->
+      val current = map[bookId]
+      if (current != null) {
+        map +
+          (bookId to
+            current.copy(
+              isRunning = false,
+              phase = GenerationPhase.IDLE,
+              statusMessage = "Generación cancelada.",
             ))
       } else {
         map
@@ -1052,18 +1261,36 @@ class AudiobookRepository(
         Pair((ids + listOfNotNull(runningId)).distinct(), activeJob)
       }
 
-    runBlocking(Dispatchers.IO) {
-      awaitPersistenceJobs()
+    active.first.forEach { id ->
+      cancelledBookIds.add(id)
+      pausedBookIds.remove(id)
+    }
+
+    enqueuePersistenceOp {
       val now = System.currentTimeMillis()
-      taskDbMutex.withLock {
-        for (id in active.first) {
-          val existing = dao.getGenerationTaskOnce(id)
-          if (existing != null) {
-            dao.updateGenerationTaskStatus(
-              bookId = id,
-              status = GenerationTaskStatus.PAUSED_BY_USER.name,
-              updatedAtMs = now,
-              errorMessage = null,
+      for (id in active.first) {
+        storageManager.cleanOrphanedTempFiles(id)
+        val existing = dao.getGenerationTaskOnce(id)
+        if (existing != null && existing.parsedStatus() != GenerationTaskStatus.COMPLETED) {
+          dao.updateGenerationTaskStatus(
+            bookId = id,
+            status = GenerationTaskStatus.CANCELLED.name,
+            updatedAtMs = now,
+            errorMessage = null,
+          )
+        }
+        val chapters = dao.getChaptersOnce(id)
+        for (ch in chapters) {
+          if (ch.audioStatus == AudioGenerationStatus.GENERATING.name) {
+            dao.updateChapterAudioState(
+              chapterId = ch.id,
+              audioStatus = AudioGenerationStatus.NOT_GENERATED.name,
+              audioFilePath = null,
+              audioDurationMs = 0L,
+              audioSizeBytes = 0L,
+              generatedChunks = ch.generatedChunks,
+              totalChunks = ch.totalChunks,
+              generationError = null,
             )
           }
         }
@@ -1071,7 +1298,7 @@ class AudiobookRepository(
       AudiobookRecoveryScheduler.cancelRecovery(context.applicationContext)
     }
 
-    active.second?.cancel()
+    active.second?.cancel(CancellationException("USER_CANCELLED"))
     _generationProgress.update { map ->
       var updated = map
       for (id in active.first) {
@@ -1082,14 +1309,25 @@ class AudiobookRepository(
               (id to
                 cur.copy(
                   isRunning = false,
-                  phase = GenerationPhase.INTERRUPTED,
-                  statusMessage = "Generación pausada por el usuario. El progreso guardado se conserva.",
+                  phase = GenerationPhase.IDLE,
+                  statusMessage = "Generación cancelada.",
                 ))
         }
       }
       updated
     }
   }
+
+  private fun enqueuePersistenceOp(block: suspend () -> Unit) {
+    taskPersistenceChannel.trySend(TaskPersistenceOp.Run(block))
+  }
+
+  internal fun resolveCancellationTaskStatus(bookId: String): GenerationTaskStatus? =
+    when {
+      cancelledBookIds.contains(bookId) -> GenerationTaskStatus.CANCELLED
+      pausedBookIds.contains(bookId) -> GenerationTaskStatus.PAUSED_BY_USER
+      else -> null
+    }
 
   fun clearGenerationError(bookId: String) {
     _generationProgress.update { map ->
@@ -1107,45 +1345,42 @@ class AudiobookRepository(
   }
 
   private suspend fun persistQueuedTaskLocked(bookId: String, forceQueuedStatus: Boolean) {
-    taskDbMutex.withLock {
-      val book = dao.getBookOnce(bookId) ?: return@withLock
-      val existing = dao.getGenerationTaskOnce(bookId)
-      val now = System.currentTimeMillis()
-      if (existing == null) {
-        dao.upsertGenerationTask(
-          GenerationTaskEntity(
-            bookId = bookId,
-            queueOrder = now,
-            voiceName = book.selectedVoice,
-            status = GenerationTaskStatus.QUEUED.name,
-            currentChapterIndex = 0,
-            currentChunkIndex = 0,
-            completedChunks = 0,
-            totalChunks = 0,
-            startedAtMs = now,
-            updatedAtMs = now,
-            lastValidProgressAtMs = 0L,
-            errorMessage = null,
-          )
+    val book = dao.getBookOnce(bookId) ?: return
+    val existing = dao.getGenerationTaskOnce(bookId)
+    val now = System.currentTimeMillis()
+    if (existing == null) {
+      dao.upsertGenerationTask(
+        GenerationTaskEntity(
+          bookId = bookId,
+          queueOrder = now,
+          voiceName = book.selectedVoice,
+          status = GenerationTaskStatus.QUEUED.name,
+          currentChapterIndex = 0,
+          currentChunkIndex = 0,
+          completedChunks = 0,
+          totalChunks = 0,
+          startedAtMs = now,
+          updatedAtMs = now,
+          lastValidProgressAtMs = 0L,
+          errorMessage = null,
         )
-      } else if (forceQueuedStatus || existing.parsedStatus() != GenerationTaskStatus.RUNNING) {
-        dao.upsertGenerationTask(
-          existing.copy(
-            voiceName = book.selectedVoice,
-            status = GenerationTaskStatus.QUEUED.name,
-            updatedAtMs = now,
-            errorMessage = null,
-          )
+      )
+    } else if (forceQueuedStatus || existing.parsedStatus() != GenerationTaskStatus.RUNNING) {
+      dao.upsertGenerationTask(
+        existing.copy(
+          voiceName = book.selectedVoice,
+          status = GenerationTaskStatus.QUEUED.name,
+          updatedAtMs = now,
+          errorMessage = null,
         )
-      }
+      )
     }
   }
 
   private suspend fun awaitPersistenceJobs() {
-    while (true) {
-      val children = taskPersistenceParentJob.children.toList()
-      if (children.isEmpty()) break
-      children.forEach { it.join() }
+    val ack = CompletableDeferred<Unit>()
+    if (taskPersistenceChannel.trySend(TaskPersistenceOp.Flush(ack)).isSuccess) {
+      withContext(Dispatchers.Default) { ack.await() }
     }
   }
 
@@ -1155,7 +1390,6 @@ class AudiobookRepository(
 
   internal suspend fun awaitAndCloseForTesting() {
     stopProgressiveGenerationForBook(bookId = null, reasonPauseOnly = false)
-    awaitPersistenceJobs()
     while (true) {
       val genChildren = generationParentJob.children.toList()
       if (genChildren.isEmpty()) break
@@ -1163,6 +1397,12 @@ class AudiobookRepository(
       genChildren.forEach { it.join() }
     }
     awaitPersistenceJobs()
+    taskPersistenceChannel.close()
+    while (true) {
+      val persistenceChildren = taskPersistenceParentJob.children.toList()
+      if (persistenceChildren.isEmpty()) break
+      persistenceChildren.forEach { it.join() }
+    }
     generationParentJob.cancel()
     taskPersistenceParentJob.cancel()
     release()

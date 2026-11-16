@@ -1,7 +1,7 @@
 <resources>
-    <string name="app_name">Audiolibro</string>
-    <string name="library_title">Audiolibro</string>
-    <string name="library_subtitle">Tu estudio de lectura y voz</string>
+    <string name="app_name">AudioLibreaMe</string>
+    <string name="library_title">AudioLibreaMe</string>
+    <string name="library_subtitle">Tu estudio de lectura y voz sin conexión</string>
     <string name="empty_library_title">Tu biblioteca está vacía</string>
     <string name="empty_library_body">Selecciona un archivo EPUB de tu dispositivo para extraer sus capítulos y generar tu audiolibro localmente sin conexión.</string>
     <string name="action_select_epub">Seleccionar archivo EPUB</string>
@@ -23,8 +23,8 @@
     <string name="copied_to_clipboard">Texto del capítulo copiado</string>
     <string name="action_prev_chapter">Anterior</string>
     <string name="action_next_chapter">Siguiente</string>
-    <string name="notification_channel_playback">Reproducción de audiolibros</string>
-    <string name="notification_channel_generation">Generación de audiolibros</string>
+    <string name="notification_channel_playback">Reproducción de AudioLibreaMe</string>
+    <string name="notification_channel_generation">Generación de AudioLibreaMe</string>
     <string name="progressive_loading_title">Cargando capítulo</string>
     <string name="progressive_load_chapter_action">Cargar capítulo</string>
     <string name="progressive_continue_chapter_action">Continuar carga</string>

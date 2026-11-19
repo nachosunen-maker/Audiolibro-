@@ -27,12 +27,12 @@ jobs:
 
     steps:
       - name: Checkout repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
 
-      - name: Setup Node.js 22
-        uses: actions/setup-node@v4
+      - name: Setup Node.js 22.23.4
+        uses: actions/setup-node@v7
         with:
-          node-version: '22'
+          node-version: '22.23.4'
           cache: 'npm'
           cache-dependency-path: web/package-lock.json
 
@@ -76,13 +76,71 @@ jobs:
           esac
 
       - name: Authenticate to Google Cloud via Workload Identity Federation (OIDC)
-        uses: google-github-actions/auth@v2
+        id: gcp_auth
+        uses: google-github-actions/auth@v3
         with:
           workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
           service_account: firebase-adminsdk-fbsvc@audiolibreame.iam.gserviceaccount.com
+          project_id: audiolibreame
+          create_credentials_file: true
+          export_environment_variables: true
+          token_format: access_token
+
+      - name: Verify Firebase Hosting API access and default site
+        env:
+          GCP_ACCESS_TOKEN: ${{ steps.gcp_auth.outputs.access_token }}
+        run: |
+          if [ -z "$GCP_ACCESS_TOKEN" ]; then
+            echo "ERROR: google-github-actions/auth@v3 no devolvió un access_token."
+            exit 1
+          fi
+
+          API_URL="https://firebasehosting.googleapis.com/v1beta1/projects/audiolibreame/sites"
+          BODY_FILE=$(mktemp)
+          HTTP_CODE=$(curl -sS -o "$BODY_FILE" -w "%{http_code}" \
+            -H "Authorization: Bearer ${GCP_ACCESS_TOKEN}" \
+            -H "Accept: application/json" \
+            "$API_URL")
+
+          echo "Firebase Hosting API GET /projects/audiolibreame/sites -> HTTP ${HTTP_CODE}"
+
+          if [ "$HTTP_CODE" != "200" ]; then
+            echo "ERROR real devuelto por Firebase Hosting API (HTTP ${HTTP_CODE}):"
+            cat "$BODY_FILE"
+            echo ""
+            rm -f "$BODY_FILE"
+            exit 1
+          fi
+
+          node -e '
+            const fs = require("node:fs");
+            const raw = fs.readFileSync(process.argv[1], "utf8");
+            const data = JSON.parse(raw);
+            const sites = Array.isArray(data.sites) ? data.sites : [];
+
+            console.log(`Sitios devueltos por Firebase Hosting (${sites.length}):`);
+            for (const s of sites) {
+              console.log(` - name=${s.name || "(sin nombre)"} | type=${s.type || "(sin tipo)"} | defaultUrl=${s.defaultUrl || "(sin url)"}`);
+            }
+
+            const defaultSite = sites.find((s) => {
+              const name = String(s.name || "");
+              const siteId = name.split("/").pop();
+              return s.type === "DEFAULT_SITE" && siteId === "audiolibreame";
+            });
+
+            if (!defaultSite) {
+              console.error("ERROR: Falta el sitio predeterminado (type=DEFAULT_SITE, id=audiolibreame) en Firebase Hosting.");
+              process.exit(1);
+            }
+
+            console.log(`Sitio predeterminado confirmado: ${defaultSite.name} (${defaultSite.defaultUrl || "https://audiolibreame.web.app"})`);
+          ' "$BODY_FILE"
+
+          rm -f "$BODY_FILE"
 
       - name: Deploy to Firebase Hosting (audiolibreame)
-        run: npx --yes firebase-tools@15.22.3 deploy --only hosting --project audiolibreame --non-interactive
+        run: npx --yes firebase-tools@15.37.0 deploy --only hosting --project audiolibreame --non-interactive --debug
 
       - name: Verify live Firebase Hosting deployment
         run: |

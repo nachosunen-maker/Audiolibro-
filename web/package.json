@@ -7,8 +7,8 @@
   "scripts": {
     "dev": "vite",
     "sync-assets": "node scripts/sync-runtime-assets.mjs",
-    "prebuild": "node scripts/sync-runtime-assets.mjs",
     "build": "tsc --noEmit && vite build",
+    "verify-dist": "node scripts/verify-dist.mjs",
     "preview": "vite preview",
     "test": "vitest run",
     "test:watch": "vitest"

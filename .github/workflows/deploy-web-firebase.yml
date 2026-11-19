@@ -39,7 +39,7 @@ jobs:
       - name: Install dependencies
         run: npm ci
 
-      - name: Sync local WASM & Piper ONNX runtime assets
+      - name: Sync & verify local WASM + Piper ONNX runtime assets
         run: npm run sync-assets
 
       - name: TypeScript typecheck
@@ -51,12 +51,16 @@ jobs:
       - name: Build production bundle
         run: npm run build
 
+      - name: Verify production dist bundle
+        run: npm run verify-dist
+
       - name: Verify Workload Identity Provider variable is configured
         env:
           WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
         run: |
           if [ -z "$WIF_PROVIDER" ]; then
             echo "ERROR: Falta la variable de repositorio GCP_WORKLOAD_IDENTITY_PROVIDER en GitHub Actions."
+            echo "Crea la variable en Settings -> Secrets and variables -> Actions -> Variables."
             echo "Formato esperado: projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL_ID>/providers/<PROVIDER_ID>"
             exit 1
           fi
@@ -80,6 +84,52 @@ jobs:
       - name: Deploy to Firebase Hosting (audiolibreame)
         run: npx --yes firebase-tools deploy --only hosting --project audiolibreame --non-interactive
 
-      - name: Report deployment result
-        if: success()
-        run: echo "Despliegue de Firebase Hosting completado en https://audiolibreame.web.app"
+      - name: Verify live Firebase Hosting deployment
+        run: |
+          BASE_URL="https://audiolibreame.web.app"
+
+          check_http_200() {
+            local path="$1"
+            local code
+            code=$(curl -sS -o /dev/null -w "%{http_code}" "${BASE_URL}${path}")
+            echo "CHECK ${path} -> HTTP ${code}"
+            if [ "$code" != "200" ]; then
+              echo "ERROR: ${BASE_URL}${path} devolvió HTTP ${code} (esperado 200)."
+              exit 1
+            fi
+          }
+
+          HTML=$(curl -fsSL "${BASE_URL}/")
+          echo "$HTML" | grep -q "AudioLibreaMe" || {
+            echo "ERROR: ${BASE_URL}/ no devuelve la aplicación AudioLibreaMe."
+            exit 1
+          }
+          echo "$HTML" | grep -qi "Site Not Found" && {
+            echo "ERROR: ${BASE_URL}/ sigue mostrando Site Not Found."
+            exit 1
+          }
+
+          HEADERS=$(curl -fsSI "${BASE_URL}/")
+          echo "$HEADERS" | grep -qi "cross-origin-opener-policy: same-origin" || {
+            echo "ERROR: Falta cabecera Cross-Origin-Opener-Policy: same-origin."
+            exit 1
+          }
+          echo "$HEADERS" | grep -qi "cross-origin-embedder-policy: credentialless" || {
+            echo "ERROR: Falta cabecera Cross-Origin-Embedder-Policy: credentialless."
+            exit 1
+          }
+
+          check_http_200 "/manifest.webmanifest"
+          check_http_200 "/sw.js"
+          check_http_200 "/assets/models/es_ES-sharvard-medium.onnx.json"
+          check_http_200 "/wasm/piper_phonemize.wasm"
+          check_http_200 "/wasm/ort-wasm-simd-threaded.wasm"
+          check_http_200 "/libro/verificacion-spa"
+
+          ONNX_HEADERS=$(curl -fsSI "${BASE_URL}/assets/models/es_ES-sharvard-medium.onnx")
+          echo "$ONNX_HEADERS" | grep -qi "content-length: 76682531" || {
+            echo "ERROR: El modelo ONNX en Hosting no tiene content-length: 76682531."
+            exit 1
+          }
+
+          echo "OK: AudioLibreaMe verificado en vivo en ${BASE_URL}"

@@ -12,8 +12,7 @@ import {
 
 const MODEL_CACHE_NAME = 'audiolibreame-piper-models-v1';
 const MODEL_CONFIG_URL = '/assets/models/es_ES-sharvard-medium.onnx.json';
-const MODEL_ONNX_URL =
-  'https://huggingface.co/rhasspy/piper-voices/resolve/v1.0.0/es/es_ES/sharvard/medium/es_ES-sharvard-medium.onnx';
+const MODEL_ONNX_URL = '/assets/models/es_ES-sharvard-medium.onnx';
 
 interface PiperConfig {
   audio: { sample_rate: number };
@@ -113,10 +112,10 @@ async function loadModelOnnxBytes(): Promise<Uint8Array> {
     loaded: 0,
     total: 0,
     fraction: 0,
-    message: 'Descargando voz neural Piper es_ES-sharvard-medium (una sola vez, ~63 MB)…',
+    message: 'Descargando voz neural Piper es_ES-sharvard-medium (una sola vez, ~73 MB)…',
   });
 
-  const response = await fetch(MODEL_ONNX_URL, { mode: 'cors' });
+  const response = await fetch(MODEL_ONNX_URL);
   if (!response.ok) {
     throw new Error(
       `No se pudo descargar el modelo Piper ONNX (HTTP ${response.status}). Comprueba tu conexión.`,

@@ -6,6 +6,8 @@
   "description": "AudioLibreaMe — Versión Web PWA multiplataforma instalable (100 % local en el navegador con Piper VITS + ONNX Runtime Web + IndexedDB)",
   "scripts": {
     "dev": "vite",
+    "sync-assets": "node scripts/sync-runtime-assets.mjs",
+    "prebuild": "node scripts/sync-runtime-assets.mjs",
     "build": "tsc --noEmit && vite build",
     "preview": "vite preview",
     "test": "vitest run",

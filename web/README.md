@@ -2,13 +2,11 @@
 
 Versión web multiplataforma (PWA) de **AudioLibreaMe**, diseñada como réplica funcional y visual fiel de la aplicación Android existente sin modificar ningún archivo Android.
 
-## Características principales
+## Infraestructura exclusiva: Firebase Hosting
 
-- **Identidad visual fiel a Android**: temas *Papel y Tinta* (claro) y *Tinta Nocturna* (oscuro), tipografías `Lora` y `Plus Jakarta Sans`, y las 5 pantallas principales (`Biblioteca`, `Detalle del libro`, `Lector de capítulo`, `Síntesis progresiva` y `Reproductor`) más `MiniPlayerBar`.
-- **100% local y privada**: los archivos EPUB, portadas, capítulos, audio generado y progreso se almacenan únicamente en **IndexedDB** en el dispositivo del usuario. Nunca se suben a servidores externos.
-- **Voz neural local Piper VITS (`es_ES-sharvard-medium`)**: mismo modelo neuronal español que Android (voces masculina `sid=0` y femenina `sid=1` a `22.050 Hz`), ejecutado en un **Web Worker** con `piper-phonemize` (eSpeak NG WASM) + `onnxruntime-web`. El modelo `.onnx` se descarga bajo demanda la primera vez y queda guardado en Cache API para uso sin conexión.
-- **Síntesis bajo demanda por capítulo + ventana deslizante en RAM**: sin conversión masiva del libro completo; los fragmentos reproducidos se liberan de RAM inmediatamente (`URL.revokeObjectURL`) manteniendo una ventana activa acotada (`20 s` en dispositivos con memoria limitada / móviles, `30 s` estándar) y recuperando desde IndexedDB al retroceder sin resintetizar.
-- **PWA instalable y offline**: `manifest.webmanifest`, `sw.js` con actualizaciones controladas, iconos adaptados y soporte de **Media Session API**.
+- **Único alojamiento**: Firebase Hosting en el proyecto `audiolibreame` (`https://audiolibreame.web.app`).
+- **Sin recursos externos en ejecución**: el modelo neuronal `es_ES-sharvard-medium.onnx`, su configuración `.onnx.json`, los binarios WASM (`piper_phonemize.*` y `onnxruntime-web`), las fuentes `Lora` y `Plus Jakarta Sans` y los iconos se sirven exclusivamente desde el propio dominio de Firebase Hosting.
+- **Privacidad total en el dispositivo**: NO se utiliza Firestore ni Firebase Storage. Todos los EPUB, portadas, capítulos, audio sintetizado y progreso permanecen en **IndexedDB** dentro del navegador del usuario.
 
 ## Comandos locales
 
@@ -16,17 +14,31 @@ Versión web multiplataforma (PWA) de **AudioLibreaMe**, diseñada como réplica
 cd web
 npm install
 npm run dev      # Servidor de desarrollo Vite
-npm test         # Suite automatizada Vitest
-npm run build    # Comprobación TypeScript + compilación de producción (dist/)
+npm test         # Suite automatizada Vitest (incluye inferencia real con Piper ONNX)
+npm run build    # Sincronización de recursos + TypeScript + compilación en dist/
 ```
 
-## Despliegue estático en Firebase Hosting (sin Firestore ni Storage)
+## Despliegue automático desde GitHub Actions a Firebase Hosting
 
-1. Copia `.firebaserc.example` a `.firebaserc` e indica tu ID de proyecto de Firebase Hosting.
-2. Compila y despliega solo los archivos estáticos:
+El flujo `.github/workflows/deploy-web-firebase.yml` compila, ejecuta TypeScript y las pruebas Vitest y solo despliega en producción (`audiolibreame`, canal `live`) si todas las comprobaciones pasan.
+
+### Configuración del secreto de autenticación en GitHub (una sola vez)
+
+1. Abre [Firebase Console](https://console.firebase.google.com/) y selecciona el proyecto **`audiolibreame`**.
+2. Ve a **Configuración del proyecto → Cuentas de servicio** (o en Google Cloud IAM → Cuentas de servicio) y crea/descarga una clave JSON con el rol **Firebase Hosting Admin** (`roles/firebasehosting.admin`).
+3. En tu repositorio de GitHub (`nachosunen-maker/Audiolibro-`), abre **Settings → Secrets and variables → Actions → New repository secret**.
+4. Crea el secreto con el nombre exacto:
+   - **Name**: `FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME`
+   - **Value**: el contenido completo del archivo JSON de la cuenta de servicio.
+5. Nunca subas ese archivo JSON al repositorio. Al hacer push a `main` con cambios en `web/` (o al ejecutar manualmente *Actions → Deploy AudioLibreaMe Web to Firebase Hosting → Run workflow*), GitHub desplegará automáticamente en `https://audiolibreame.web.app`.
+
+### Despliegue manual local (alternativa desde tu equipo)
 
 ```bash
 cd web
+npm install
+npm test
 npm run build
-firebase deploy --only hosting
+npx firebase-tools login
+npx firebase-tools deploy --only hosting --project audiolibreame
 ```

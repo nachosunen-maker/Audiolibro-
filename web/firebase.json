@@ -3,8 +3,14 @@
     "public": "dist",
     "ignore": [
       "firebase.json",
+      ".firebaserc",
+      ".firebaserc.example",
       "**/.*",
-      "**/node_modules/**"
+      "**/node_modules/**",
+      "**/*.map",
+      "src/**",
+      "tests/**",
+      "scripts/**"
     ],
     "headers": [
       {
@@ -26,11 +32,98 @@
           {
             "key": "Cache-Control",
             "value": "no-cache, no-store, must-revalidate"
+          },
+          {
+            "key": "Service-Worker-Allowed",
+            "value": "/"
+          }
+        ]
+      },
+      {
+        "source": "/index.html",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "no-cache, no-store, must-revalidate"
+          }
+        ]
+      },
+      {
+        "source": "/manifest.webmanifest",
+        "headers": [
+          {
+            "key": "Content-Type",
+            "value": "application/manifest+json; charset=utf-8"
+          },
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=3600"
+          }
+        ]
+      },
+      {
+        "source": "**/*.wasm",
+        "headers": [
+          {
+            "key": "Content-Type",
+            "value": "application/wasm"
+          },
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=31536000, immutable"
+          }
+        ]
+      },
+      {
+        "source": "**/*.onnx",
+        "headers": [
+          {
+            "key": "Content-Type",
+            "value": "application/octet-stream"
+          },
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=31536000, immutable"
+          }
+        ]
+      },
+      {
+        "source": "**/*.data",
+        "headers": [
+          {
+            "key": "Content-Type",
+            "value": "application/octet-stream"
+          },
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=31536000, immutable"
+          }
+        ]
+      },
+      {
+        "source": "**/*.ttf",
+        "headers": [
+          {
+            "key": "Content-Type",
+            "value": "font/ttf"
+          },
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=31536000, immutable"
           }
         ]
       },
       {
         "source": "/assets/**",
+        "headers": [
+          {
+            "key": "Cache-Control",
+            "value": "public, max-age=31536000, immutable"
+          }
+        ]
+      },
+      {
+        "source": "/wasm/**",
         "headers": [
           {
             "key": "Cache-Control",

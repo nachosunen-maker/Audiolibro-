@@ -1,5 +1,5 @@
-const APP_CACHE = 'audiolibreame-shell-v1';
-const MODEL_CACHE = 'audiolibreame-models-v1';
+const APP_CACHE = 'audiolibreame-shell-v2';
+const MODEL_CACHE = 'audiolibreame-piper-models-v1';
 
 const PRECACHE_URLS = [
   '/',
@@ -22,13 +22,16 @@ self.addEventListener('install', (event) => {
 
 self.addEventListener('activate', (event) => {
   event.waitUntil(
-    caches.keys().then((keys) =>
-      Promise.all(
-        keys
-          .filter((key) => key !== APP_CACHE && key !== MODEL_CACHE)
-          .map((key) => caches.delete(key))
+    caches
+      .keys()
+      .then((keys) =>
+        Promise.all(
+          keys
+            .filter((key) => key !== APP_CACHE && key !== MODEL_CACHE)
+            .map((key) => caches.delete(key))
+        )
       )
-    ).then(() => self.clients.claim())
+      .then(() => self.clients.claim())
   );
 });
 
@@ -43,13 +46,16 @@ self.addEventListener('fetch', (event) => {
   if (req.method !== 'GET') return;
 
   const url = new URL(req.url);
+  // Solo gestionar recursos del mismo dominio (Firebase Hosting)
+  if (url.origin !== self.location.origin) return;
 
-  // Cache ONNX model & WASM binaries in MODEL_CACHE (cache-first, preserved across app updates)
+  // Caché dedicada y persistente para el modelo ONNX Piper y binarios WASM/datos de ejecución
   if (
     url.pathname.endsWith('.onnx') ||
     url.pathname.endsWith('.onnx.json') ||
     url.pathname.endsWith('.wasm') ||
-    url.hostname.includes('huggingface.co')
+    url.pathname.endsWith('.data') ||
+    url.pathname.startsWith('/wasm/')
   ) {
     event.respondWith(
       caches.open(MODEL_CACHE).then(async (cache) => {
@@ -65,14 +71,14 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Same-origin navigation: network-first with offline index.html fallback
+  // Navegación SPA: network-first con respaldo offline en index.html para evitar versiones antiguas
   if (req.mode === 'navigate') {
     event.respondWith(
       fetch(req)
         .then((res) => {
           if (res && res.ok) {
             const copy = res.clone();
-            caches.open(APP_CACHE).then((cache) => cache.put(req, copy));
+            caches.open(APP_CACHE).then((cache) => cache.put('/index.html', copy));
           }
           return res;
         })
@@ -84,21 +90,19 @@ self.addEventListener('fetch', (event) => {
     return;
   }
 
-  // Same-origin static assets: stale-while-revalidate
-  if (url.origin === self.location.origin) {
-    event.respondWith(
-      caches.open(APP_CACHE).then(async (cache) => {
-        const cached = await cache.match(req);
-        const networkPromise = fetch(req)
-          .then((res) => {
-            if (res && res.ok) {
-              cache.put(req, res.clone());
-            }
-            return res;
-          })
-          .catch(() => cached);
-        return cached || networkPromise;
-      })
-    );
-  }
+  // Resto de recursos propios (JS/CSS con hash, iconos, fuentes): stale-while-revalidate
+  event.respondWith(
+    caches.open(APP_CACHE).then(async (cache) => {
+      const cached = await cache.match(req);
+      const networkPromise = fetch(req)
+        .then((res) => {
+          if (res && res.ok) {
+            cache.put(req, res.clone());
+          }
+          return res;
+        })
+        .catch(() => cached);
+      return cached || networkPromise;
+    })
+  );
 });

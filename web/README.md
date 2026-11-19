@@ -18,27 +18,21 @@ npm test         # Suite automatizada Vitest (incluye inferencia real con Piper 
 npm run build    # Sincronización de recursos + TypeScript + compilación en dist/
 ```
 
-## Despliegue automático desde GitHub Actions a Firebase Hosting
+## Despliegue automático con Workload Identity Federation (OIDC)
 
-El flujo `.github/workflows/deploy-web-firebase.yml` compila, ejecuta TypeScript y las pruebas Vitest y solo despliega en producción (`audiolibreame`, canal `live`) si todas las comprobaciones pasan.
+El flujo `.github/workflows/deploy-web-firebase.yml` compila, ejecuta TypeScript y las pruebas Vitest y autentica contra Google Cloud mediante **OIDC** (`google-github-actions/auth@v2`), sin claves privadas JSON permanentes.
 
-### Configuración del secreto de autenticación en GitHub (una sola vez)
+### Requisitos en Google Cloud (`audiolibreame`) y GitHub Actions
 
-1. Abre [Firebase Console](https://console.firebase.google.com/) y selecciona el proyecto **`audiolibreame`**.
-2. Ve a **Configuración del proyecto → Cuentas de servicio** (o en Google Cloud IAM → Cuentas de servicio) y crea/descarga una clave JSON con el rol **Firebase Hosting Admin** (`roles/firebasehosting.admin`).
-3. En tu repositorio de GitHub (`nachosunen-maker/Audiolibro-`), abre **Settings → Secrets and variables → Actions → New repository secret**.
-4. Crea el secreto con el nombre exacto:
-   - **Name**: `FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME`
-   - **Value**: el contenido completo del archivo JSON de la cuenta de servicio.
-5. Nunca subas ese archivo JSON al repositorio. Al hacer push a `main` con cambios en `web/` (o al ejecutar manualmente *Actions → Deploy AudioLibreaMe Web to Firebase Hosting → Run workflow*), GitHub desplegará automáticamente en `https://audiolibreame.web.app`.
-
-### Despliegue manual local (alternativa desde tu equipo)
-
-```bash
-cd web
-npm install
-npm test
-npm run build
-npx firebase-tools login
-npx firebase-tools deploy --only hosting --project audiolibreame
-```
+1. **Workload Identity Pool**: `github-actions-pool` (en `IAM y administración → Workload Identity Federation`).
+2. **Proveedor OIDC**: `github-actions-provider` con emisor `https://token.actions.githubusercontent.com`, mapeo `google.subject=assertion.sub`, `attribute.repository=assertion.repository`, `attribute.ref=assertion.ref` y condición de atributo:
+   ```
+   assertion.repository == 'nachosunen-maker/Audiolibro-' && assertion.ref == 'refs/heads/main'
+   ```
+3. **Cuenta de servicio**: `firebase-adminsdk-fbsvc@audiolibreame.iam.gserviceaccount.com` con los roles mínimos:
+   - `roles/firebasehosting.admin` (**Administrador de Firebase Hosting**)
+   - `roles/serviceusage.serviceUsageConsumer` (**Consumidor de Service Usage**)
+   - Vinculación de `roles/iam.workloadIdentityUser` para el principal del repositorio `nachosunen-maker/Audiolibro-`.
+4. **Variable de repositorio en GitHub** (*Settings → Secrets and variables → Actions → Variables*):
+   - Nombre: `GCP_WORKLOAD_IDENTITY_PROVIDER`
+   - Valor: `projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/github-actions-pool/providers/github-actions-provider`

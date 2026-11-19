@@ -11,6 +11,7 @@ on:
 
 permissions:
   contents: read
+  id-token: write
 
 concurrency:
   group: firebase-hosting-live
@@ -50,125 +51,35 @@ jobs:
       - name: Build production bundle
         run: npm run build
 
-      - name: Prepare & validate Firebase service account credentials
+      - name: Verify Workload Identity Provider variable is configured
         env:
-          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME }}
+          WIF_PROVIDER: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
         run: |
-          node -e '
-            const fs = require("node:fs");
-            const path = require("node:path");
+          if [ -z "$WIF_PROVIDER" ]; then
+            echo "ERROR: Falta la variable de repositorio GCP_WORKLOAD_IDENTITY_PROVIDER en GitHub Actions."
+            echo "Formato esperado: projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL_ID>/providers/<PROVIDER_ID>"
+            exit 1
+          fi
+          case "$WIF_PROVIDER" in
+            projects/*/locations/global/workloadIdentityPools/*/providers/*)
+              echo "Proveedor OIDC configurado con formato válido."
+              ;;
+            *)
+              echo "ERROR: El formato de GCP_WORKLOAD_IDENTITY_PROVIDER no es válido."
+              echo "Formato esperado: projects/<PROJECT_NUMBER>/locations/global/workloadIdentityPools/<POOL_ID>/providers/<PROVIDER_ID>"
+              exit 1
+              ;;
+          esac
 
-            function escapeLiteralNewlinesInStrings(input) {
-              let out = "";
-              let inString = false;
-              let escaped = false;
-              for (let i = 0; i < input.length; i++) {
-                const ch = input[i];
-                if (inString) {
-                  if (escaped) {
-                    out += ch;
-                    escaped = false;
-                  } else if (ch === "\\") {
-                    out += ch;
-                    escaped = true;
-                  } else if (ch === "\"") {
-                    out += ch;
-                    inString = false;
-                  } else if (ch === "\r") {
-                    if (input[i + 1] === "\n") i++;
-                    out += "\\n";
-                  } else if (ch === "\n") {
-                    out += "\\n";
-                  } else {
-                    out += ch;
-                  }
-                } else {
-                  if (ch === "\"") {
-                    inString = true;
-                  }
-                  out += ch;
-                }
-              }
-              return out;
-            }
-
-            function parseServiceAccountSecret(raw) {
-              let cleaned = raw
-                .replace(/^\uFEFF/, "")
-                .replace(/[\u200B-\u200D\uFEFF]/g, "")
-                .replace(/\u00A0/g, " ")
-                .trim();
-
-              if (!cleaned.startsWith("{") && /^[A-Za-z0-9+/=\r\n]+$/.test(cleaned)) {
-                try {
-                  const decoded = Buffer.from(cleaned, "base64").toString("utf8").replace(/^\uFEFF/, "").trim();
-                  if (decoded.startsWith("{")) cleaned = decoded;
-                } catch {}
-              }
-
-              try {
-                return JSON.parse(cleaned);
-              } catch {
-                // Normalización segura para pegados desde móvil/editores:
-                // comillas tipográficas, saltos de línea literales dentro de cadenas (p.ej. private_key) y comas finales.
-                const normalized = escapeLiteralNewlinesInStrings(
-                  cleaned.replace(/[“”]/g, "\"")
-                ).replace(/,\s*([}\]])/g, "$1");
-                return JSON.parse(normalized);
-              }
-            }
-
-            const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
-            if (!raw || !raw.trim()) {
-              console.error("ERROR: El secreto FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME está vacío o no está configurado.");
-              process.exit(1);
-            }
-
-            let parsed;
-            try {
-              parsed = parseServiceAccountSecret(raw);
-            } catch (err) {
-              const lineCount = raw.split(/\r?\n/).length;
-              console.error(
-                `ERROR: El secreto FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME sigue sin ser un JSON válido tras la normalización (longitud=${raw.length}, líneas=${lineCount}): ${err.message}`
-              );
-              process.exit(1);
-            }
-
-            if (parsed.type !== "service_account") {
-              console.error("ERROR: El campo \"type\" del JSON debe ser \"service_account\".");
-              process.exit(1);
-            }
-
-            if (parsed.project_id !== "audiolibreame") {
-              console.error("ERROR: El campo \"project_id\" del JSON debe ser \"audiolibreame\".");
-              process.exit(1);
-            }
-
-            if (typeof parsed.private_key === "string") {
-              parsed.private_key = parsed.private_key.replace(/\r\n/g, "\n");
-            }
-
-            if (typeof parsed.private_key !== "string" || !parsed.private_key.includes("BEGIN PRIVATE KEY")) {
-              console.error("ERROR: El campo \"private_key\" no contiene una clave PEM válida.");
-              process.exit(1);
-            }
-
-            const tempDir = process.env.RUNNER_TEMP || "/tmp";
-            const credPath = path.join(tempDir, "firebase-sa-audiolibreame.json");
-            fs.writeFileSync(credPath, JSON.stringify(parsed), { mode: 0o600 });
-            fs.chmodSync(credPath, 0o600);
-
-            if (process.env.GITHUB_ENV) {
-              fs.appendFileSync(process.env.GITHUB_ENV, `GOOGLE_APPLICATION_CREDENTIALS=${credPath}\n`);
-            }
-
-            console.log(`Credenciales validadas correctamente (type=${parsed.type}, project_id=${parsed.project_id}).`);
-          '
+      - name: Authenticate to Google Cloud via Workload Identity Federation (OIDC)
+        uses: google-github-actions/auth@v2
+        with:
+          workload_identity_provider: ${{ vars.GCP_WORKLOAD_IDENTITY_PROVIDER }}
+          service_account: firebase-adminsdk-fbsvc@audiolibreame.iam.gserviceaccount.com
 
       - name: Deploy to Firebase Hosting (audiolibreame)
         run: npx --yes firebase-tools deploy --only hosting --project audiolibreame --non-interactive
 
-      - name: Clean up temporary Firebase credentials
-        if: always()
-        run: rm -f "${RUNNER_TEMP:-/tmp}/firebase-sa-audiolibreame.json"
+      - name: Report deployment result
+        if: success()
+        run: echo "Despliegue de Firebase Hosting completado en https://audiolibreame.web.app"

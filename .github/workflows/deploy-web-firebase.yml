@@ -58,18 +58,80 @@ jobs:
             const fs = require("node:fs");
             const path = require("node:path");
 
+            function escapeLiteralNewlinesInStrings(input) {
+              let out = "";
+              let inString = false;
+              let escaped = false;
+              for (let i = 0; i < input.length; i++) {
+                const ch = input[i];
+                if (inString) {
+                  if (escaped) {
+                    out += ch;
+                    escaped = false;
+                  } else if (ch === "\\") {
+                    out += ch;
+                    escaped = true;
+                  } else if (ch === "\"") {
+                    out += ch;
+                    inString = false;
+                  } else if (ch === "\r") {
+                    if (input[i + 1] === "\n") i++;
+                    out += "\\n";
+                  } else if (ch === "\n") {
+                    out += "\\n";
+                  } else {
+                    out += ch;
+                  }
+                } else {
+                  if (ch === "\"") {
+                    inString = true;
+                  }
+                  out += ch;
+                }
+              }
+              return out;
+            }
+
+            function parseServiceAccountSecret(raw) {
+              let cleaned = raw
+                .replace(/^\uFEFF/, "")
+                .replace(/[\u200B-\u200D\uFEFF]/g, "")
+                .replace(/\u00A0/g, " ")
+                .trim();
+
+              if (!cleaned.startsWith("{") && /^[A-Za-z0-9+/=\r\n]+$/.test(cleaned)) {
+                try {
+                  const decoded = Buffer.from(cleaned, "base64").toString("utf8").replace(/^\uFEFF/, "").trim();
+                  if (decoded.startsWith("{")) cleaned = decoded;
+                } catch {}
+              }
+
+              try {
+                return JSON.parse(cleaned);
+              } catch {
+                // Normalización segura para pegados desde móvil/editores:
+                // comillas tipográficas, saltos de línea literales dentro de cadenas (p.ej. private_key) y comas finales.
+                const normalized = escapeLiteralNewlinesInStrings(
+                  cleaned.replace(/[“”]/g, "\"")
+                ).replace(/,\s*([}\]])/g, "$1");
+                return JSON.parse(normalized);
+              }
+            }
+
             const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
             if (!raw || !raw.trim()) {
               console.error("ERROR: El secreto FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME está vacío o no está configurado.");
               process.exit(1);
             }
 
-            const cleaned = raw.replace(/^\uFEFF/, "").trim();
             let parsed;
             try {
-              parsed = JSON.parse(cleaned);
+              parsed = parseServiceAccountSecret(raw);
             } catch (err) {
-              console.error("ERROR: El secreto FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME no es un JSON válido:", err.message);
+              const lineCount = raw.split(/\r?\n/).length;
+              console.error(
+                `ERROR: El secreto FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME sigue sin ser un JSON válido tras la normalización (longitud=${raw.length}, líneas=${lineCount}): ${err.message}`
+              );
               process.exit(1);
             }
 
@@ -80,6 +142,15 @@ jobs:
 
             if (parsed.project_id !== "audiolibreame") {
               console.error("ERROR: El campo \"project_id\" del JSON debe ser \"audiolibreame\".");
+              process.exit(1);
+            }
+
+            if (typeof parsed.private_key === "string") {
+              parsed.private_key = parsed.private_key.replace(/\r\n/g, "\n");
+            }
+
+            if (typeof parsed.private_key !== "string" || !parsed.private_key.includes("BEGIN PRIVATE KEY")) {
+              console.error("ERROR: El campo \"private_key\" no contiene una clave PEM válida.");
               process.exit(1);
             }
 

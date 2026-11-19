@@ -50,11 +50,54 @@ jobs:
       - name: Build production bundle
         run: npm run build
 
+      - name: Prepare & validate Firebase service account credentials
+        env:
+          FIREBASE_SERVICE_ACCOUNT_JSON: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME }}
+        run: |
+          node -e '
+            const fs = require("node:fs");
+            const path = require("node:path");
+
+            const raw = process.env.FIREBASE_SERVICE_ACCOUNT_JSON;
+            if (!raw || !raw.trim()) {
+              console.error("ERROR: El secreto FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME está vacío o no está configurado.");
+              process.exit(1);
+            }
+
+            const cleaned = raw.replace(/^\uFEFF/, "").trim();
+            let parsed;
+            try {
+              parsed = JSON.parse(cleaned);
+            } catch (err) {
+              console.error("ERROR: El secreto FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME no es un JSON válido:", err.message);
+              process.exit(1);
+            }
+
+            if (parsed.type !== "service_account") {
+              console.error("ERROR: El campo \"type\" del JSON debe ser \"service_account\".");
+              process.exit(1);
+            }
+
+            if (parsed.project_id !== "audiolibreame") {
+              console.error("ERROR: El campo \"project_id\" del JSON debe ser \"audiolibreame\".");
+              process.exit(1);
+            }
+
+            const tempDir = process.env.RUNNER_TEMP || "/tmp";
+            const credPath = path.join(tempDir, "firebase-sa-audiolibreame.json");
+            fs.writeFileSync(credPath, JSON.stringify(parsed), { mode: 0o600 });
+            fs.chmodSync(credPath, 0o600);
+
+            if (process.env.GITHUB_ENV) {
+              fs.appendFileSync(process.env.GITHUB_ENV, `GOOGLE_APPLICATION_CREDENTIALS=${credPath}\n`);
+            }
+
+            console.log(`Credenciales validadas correctamente (type=${parsed.type}, project_id=${parsed.project_id}).`);
+          '
+
       - name: Deploy to Firebase Hosting (audiolibreame)
-        uses: FirebaseExtended/action-hosting-deploy@v0
-        with:
-          repoToken: ${{ secrets.GITHUB_TOKEN }}
-          firebaseServiceAccount: ${{ secrets.FIREBASE_SERVICE_ACCOUNT_AUDIOLIBREAME }}
-          projectId: audiolibreame
-          channelId: live
-          entryPoint: ./web
+        run: npx --yes firebase-tools deploy --only hosting --project audiolibreame --non-interactive
+
+      - name: Clean up temporary Firebase credentials
+        if: always()
+        run: rm -f "${RUNNER_TEMP:-/tmp}/firebase-sa-audiolibreame.json"

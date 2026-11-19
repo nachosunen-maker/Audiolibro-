@@ -82,7 +82,7 @@ jobs:
           service_account: firebase-adminsdk-fbsvc@audiolibreame.iam.gserviceaccount.com
 
       - name: Deploy to Firebase Hosting (audiolibreame)
-        run: npx --yes firebase-tools deploy --only hosting --project audiolibreame --non-interactive
+        run: npx --yes firebase-tools@15.22.3 deploy --only hosting --project audiolibreame --non-interactive
 
       - name: Verify live Firebase Hosting deployment
         run: |

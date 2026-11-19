@@ -1,0 +1,33 @@
+{
+  "name": "audiolibreame-web",
+  "version": "1.0.0",
+  "private": true,
+  "type": "module",
+  "description": "AudioLibreaMe — Versión Web PWA multiplataforma instalable (100 % local en el navegador con Piper VITS + ONNX Runtime Web + IndexedDB)",
+  "scripts": {
+    "dev": "vite",
+    "build": "tsc --noEmit && vite build",
+    "preview": "vite preview",
+    "test": "vitest run",
+    "test:watch": "vitest"
+  },
+  "dependencies": {
+    "@diffusionstudio/piper-wasm": "^1.0.0",
+    "idb": "^8.0.4",
+    "jszip": "^3.10.2",
+    "lucide-react": "^0.511.0",
+    "onnxruntime-web": "^1.20.1",
+    "react": "^19.0.0",
+    "react-dom": "^19.0.0"
+  },
+  "devDependencies": {
+    "@types/react": "^19.0.8",
+    "@types/react-dom": "^19.0.4",
+    "@vitejs/plugin-react": "^4.3.4",
+    "fake-indexeddb": "^6.0.0",
+    "jsdom": "^26.0.0",
+    "typescript": "^5.7.3",
+    "vite": "^6.1.0",
+    "vitest": "^3.0.5"
+  }
+}
